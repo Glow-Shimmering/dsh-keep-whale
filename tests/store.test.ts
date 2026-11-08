@@ -133,8 +133,20 @@ test('interactions are idempotent, alternate lines, do not change mood or enqueu
     const first = e.store.recordInteraction('pet', 'x');
     assert.deepEqual(e.store.recordInteraction('pet', 'x'), first);
     assert.notEqual(e.store.recordInteraction('pet', 'y').text, first.text);
+    for (const type of ['pet', 'feed'] as const) {
+      const recent: string[] = [];
+      for (let i = 0; i < 12; i++) {
+        const response = e.store.recordInteraction(type, `${type}-${i}`);
+        assert.ok(response.text.trim());
+        assert.ok(!recent.slice(-5).includes(response.text), '最近五次同类互动不应重复');
+        recent.push(response.text);
+      }
+    }
     assert.equal(e.store.companion().mood, '担心');
     assert.deepEqual(e.store.pendingSources(), []);
+    assert.deepEqual(e.store.memories(), []);
+    assert.deepEqual(e.store.messages(), []);
+    assert.deepEqual(e.store.ledger(), []);
     e.advance(24 * 3600 * 1000 + 1);
     assert.equal(e.store.interactions().length, 0);
   } finally { e.cleanup(); }

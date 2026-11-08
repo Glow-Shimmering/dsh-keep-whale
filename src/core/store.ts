@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Companion, Interaction, Job, Ledger, Memory, MemoryKind, Message, Settings, Source, Usage } from '../types.js';
+import { interactionFeedback } from './interaction.js';
 
 const DAY_MS = 86_400_000;
 /** The product's budget and evidence day follows Beijing time, independent of host locale. */
@@ -265,10 +266,9 @@ export class Store {
     return this.transaction(() => {
       const id = 'interaction:' + requestId;
       const previous = this.db.prepare('SELECT data FROM interactions WHERE id=?').get(id); if (previous) return parse<Interaction>(previous.data);
-      const lines = type === 'pet' ? ['轻轻蹭了蹭你的手。', '安静地靠近了一点。', '抬头看了看你。'] : ['收下了你给的食物。', '认真尝了一口。', '把食物小心地接住了。'];
-      const last = this.interactions().find(x => x.type === type)?.text;
-      const index = Math.max(0, lines.indexOf(last || '') + 1) % lines.length;
-      const interaction: Interaction = { id, type, text: lines[index], createdAt: this.clock() };
+      const now = this.clock();
+      const text = interactionFeedback(type, this.companion().mood, this.interactions(), now);
+      const interaction: Interaction = { id, type, text, createdAt: now };
       this.db.prepare('INSERT INTO interactions(id,created_at,data) VALUES(?,?,?)').run(id, interaction.createdAt, JSON.stringify(interaction)); return interaction;
     });
   }

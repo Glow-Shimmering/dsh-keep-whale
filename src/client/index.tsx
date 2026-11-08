@@ -99,11 +99,16 @@ window.__ModuleLoader__.load({
       return {data:snapshot, connectionError};
     }
     type Tab = 'chat' | 'memory' | 'activity' | 'settings';
+    function selectPanel(ctx:any,id:string|null) {
+      if(typeof ctx.layout?.selectPanel!=='function')throw new Error('伙伴面板暂时无法打开，请重新加载插件。');
+      ctx.layout.selectPanel(id);
+    }
     function openPanel(ctx: any, tab: Tab = 'chat') {
       nextTab = tab;
-      try { (ctx.layout || ctx.get?.('layout'))?.selectPanel(PANEL); }
-      catch { connectionError = '当前 DSH 无法打开伙伴面板，请尝试从侧边栏打开。'; emit(); }
+      try { selectPanel(ctx,PANEL); }
+      catch { return false; }
       window.dispatchEvent(new CustomEvent('dsh-keep-whale:tab', {detail:tab}));
+      return true;
     }
     function isEditable(target: EventTarget | null) {
       if (!(target instanceof HTMLElement)) return false;
@@ -342,7 +347,7 @@ window.__ModuleLoader__.load({
       useEffect(()=>{setError('');setNotice('');},[tab]);
       const tabs:Array<[Tab,string]>=[['chat','聊聊'],['memory','记忆'],['activity','近况'],['settings','设置']];
       return <div className="kw-root kw-main"><style>{css}</style><div className="kw-shell">
-        <header className="kw-header"><div><div className="kw-eyebrow">DSH Keep Whale</div><h1>{data?.companion.name || '陪伴伙伴'}</h1><p>一间属于你们的小空间</p></div><button type="button" onClick={()=>{try{(ctx.layout||ctx.get?.('layout'))?.selectPanel(null);}catch(e){setError(formatError(e));}}}>返回 DSH</button></header>
+        <header className="kw-header"><div><div className="kw-eyebrow">DSH Keep Whale</div><h1>{data?.companion.name || '陪伴伙伴'}</h1><p>一间属于你们的小空间</p></div><button type="button" onClick={()=>{try{selectPanel(ctx,null);}catch(e){setError(formatError(e));}}}>返回 DSH</button></header>
         <nav className="kw-tabs" role="tablist" aria-label="伙伴面板">{tabs.map(([id,title])=><button key={id} type="button" role="tab" aria-selected={tab===id} onClick={()=>{setTab(id);nextTab=id;}}>{title}{id==='chat'&&!!data?.unread?` · ${data.unread}`:''}</button>)}</nav>
         {offline && <p className="kw-error" role="status">{offline} {data && '下方是上次成功连接时的信息。'}</p>}
         {(error||data?.error) && <p className="kw-error" role="alert">{error||data?.error}</p>}{notice && <p className="kw-notice" role="status">{notice}</p>}
@@ -360,12 +365,14 @@ window.__ModuleLoader__.load({
       const {data,connectionError:offline}=useData(); usePresence();
       const [pos,setPos]=useState<Pos>(()=>{const isCollapsed=read(KEY_COLLAPSED,false);return clamp(read(KEY_POSITION,defaultPosition(isCollapsed)),isCollapsed);});
       const [collapsed,setCollapsed]=useState(()=>read(KEY_COLLAPSED,false));
-      const [menu,setMenu]=useState(false), [bubble,setBubble]=useState(''), [anim,setAnim]=useState(false);
+      const [menu,setMenu]=useState(false), [bubble,setBubble]=useState('');
+      const [anim,setAnim]=useState<'pet'|'feed'|null>(null), [interacting,setInteracting]=useState(false);
+      const actionPending=useRef(false), animationTimer=useRef<ReturnType<typeof setTimeout>|null>(null), mounted=useRef(true);
       const drag=useRef<{x:number;y:number;origin:Pos;moved:boolean;pointerId:number}|null>(null);
       const suppressClick=useRef(false), previousUnread=useRef<number|null>(null), dismiss=useRef<ReturnType<typeof setTimeout>|null>(null);
       const positionRef=useRef(pos); positionRef.current=pos;
       useEffect(()=>{const resize=()=>setPos(p=>{const adjusted=clamp(p,collapsed);write(KEY_POSITION,adjusted);return adjusted;});window.addEventListener('resize',resize);return()=>window.removeEventListener('resize',resize);},[collapsed]);
-      useEffect(()=>()=>{if(dismiss.current)clearTimeout(dismiss.current);},[]);
+      useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;if(dismiss.current)clearTimeout(dismiss.current);if(animationTimer.current)clearTimeout(animationTimer.current);};},[]);
       useEffect(()=>{
         if(!data)return;
         const before=previousUnread.current; previousUnread.current=data.unread;
@@ -376,7 +383,24 @@ window.__ModuleLoader__.load({
         if(dismiss.current)clearTimeout(dismiss.current);dismiss.current=setTimeout(()=>setBubble(''),10000);
       },[data?.unread,data?.settings.quiet,data?.messages]);
       const toggle=()=>{const next=!collapsed;setCollapsed(next);write(KEY_COLLAPSED,next);setMenu(false);setBubble('');setPos(p=>{const nextPos=clamp({x:p.x,y:p.y+overlaySize(collapsed).height-overlaySize(next).height},next);write(KEY_POSITION,nextPos);return nextPos;});};
-      const interact=async(type:'pet'|'feed')=>{try{const result=await act('interaction',{type,requestId:createId()});const text=typeof result.text==='string'?result.text:typeof result.interaction?.text==='string'?result.interaction.text:type==='pet'?'嗯，在这里。':'谢谢，我收下啦。';setBubble(text);setAnim(true);setTimeout(()=>setAnim(false),700);if(dismiss.current)clearTimeout(dismiss.current);dismiss.current=setTimeout(()=>setBubble(''),5000);}catch(e){setBubble(formatError(e));}};
+      const showPanel=(tab:Tab)=>{setMenu(false);setBubble(openPanel(ctx,tab)?'':'伙伴面板暂时无法打开，请从侧边栏「陪伴伙伴」进入。');};
+      const interact=async(type:'pet'|'feed')=>{
+        if(actionPending.current||animationTimer.current)return;
+        actionPending.current=true;setInteracting(true);setMenu(false);setBubble('');setAnim(type);
+        if(dismiss.current)clearTimeout(dismiss.current);
+        // Start on the click, not after the next state poll. No model is involved.
+        animationTimer.current=setTimeout(()=>{animationTimer.current=null;if(mounted.current)setAnim(null);},1700);
+        try {
+          const result=await send('action',{action:'interaction',type,requestId:createId()});
+          if(!mounted.current)return;
+          setBubble(typeof result.text==='string'?result.text:type==='pet'?'嗯，我在。':'谢谢，我收下啦。');
+          dismiss.current=setTimeout(()=>setBubble(''),4500);
+          void refresh().finally(schedule);
+        }catch(e){
+          if(!mounted.current)return;
+          if(animationTimer.current)clearTimeout(animationTimer.current);animationTimer.current=null;setAnim(null);setBubble(formatError(e));
+        }finally{actionPending.current=false;if(mounted.current)setInteracting(false);}
+      };
       const down=(e:React.PointerEvent<HTMLDivElement>)=>{if(e.button!==0 || (e.target instanceof Element && e.target.closest('.kw-overlay-menu,.kw-bubble,.kw-collapse')))return;drag.current={x:e.clientX,y:e.clientY,origin:pos,moved:false,pointerId:e.pointerId};const pet=e.target instanceof Element?e.target.closest('.kw-pet'):null;if(pet instanceof HTMLElement)pet.setPointerCapture(e.pointerId);};
       const move=(e:React.PointerEvent<HTMLDivElement>)=>{const d=drag.current;if(!d||d.pointerId!==e.pointerId)return;const dx=e.clientX-d.x,dy=e.clientY-d.y;if(Math.abs(dx)+Math.abs(dy)>5)d.moved=true;if(d.moved){setMenu(false);setBubble('');setPos(clamp({x:d.origin.x+dx,y:d.origin.y+dy},collapsed));}};
       const up=(e:React.PointerEvent<HTMLDivElement>)=>{const d=drag.current;if(!d||d.pointerId!==e.pointerId)return;drag.current=null;if(d.moved){suppressClick.current=true;write(KEY_POSITION,positionRef.current);setTimeout(()=>{suppressClick.current=false;},0);} };
@@ -384,17 +408,27 @@ window.__ModuleLoader__.load({
       if(pos.y<250){menuStyle.bottom='auto';menuStyle.top='100%';menuStyle.marginTop=8;}
       return <div className={`kw-root kw-overlay ${collapsed?'kw-collapsed':''} ${offline?'kw-offline':''}`} style={{left:pos.x,top:pos.y}} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
         <style>{css}</style>
-        <button type="button" className={`kw-pet ${anim?'is-action':''}`} aria-label={collapsed?'展开伙伴':`${data?.companion.name||'伙伴'}互动菜单`} aria-expanded={menu} onClick={()=>{if(suppressClick.current)return;if(collapsed){toggle();return;}setMenu(old=>!old);setBubble('');}}>
-          {!collapsed&&<img src={data?.settings.skin||`${PREFIX}/portrait.png`} alt="" draggable={false} onError={e=>{if(!e.currentTarget.dataset.fallback){e.currentTarget.dataset.fallback='1';e.currentTarget.src=`${PREFIX}/portrait.png`;}}}/>}
+        <button type="button" className={`kw-pet ${anim?`is-${anim}`:''}`} aria-label={collapsed?'展开伙伴':`${data?.companion.name||'伙伴'}互动菜单`} aria-expanded={menu} onClick={()=>{if(suppressClick.current)return;if(collapsed){toggle();return;}setMenu(old=>!old);setBubble('');}}>
+          {!collapsed&&<span className="kw-portrait-stage">
+            <img src={data?.settings.skin||`${PREFIX}/portrait.png`} alt="" draggable={false} onError={e=>{if(!e.currentTarget.dataset.fallback){e.currentTarget.dataset.fallback='1';e.currentTarget.src=`${PREFIX}/portrait.png`;}}}/>
+            {anim==='pet'&&<span className="kw-interaction-art kw-pat" aria-hidden="true">
+              <svg className="kw-pat-hand" viewBox="0 0 64 48"><path d="M57 15 36 7c-4-2-7 3-3 5l8 4-23-5c-5-1-6 5-2 6l18 5-24-3c-5 0-5 6-1 7l25 3-20 1c-5 1-4 6 0 6l24 1-8 3c-4 2-2 7 2 6l17-6c7-3 9-9 10-15Z" fill="#ffe6cf" stroke="#796073" strokeWidth="2.2" strokeLinejoin="round"/><path d="m54 12 6 2-1 15-7-2" fill="#b5e2f6" stroke="#796073" strokeWidth="2.2"/></svg>
+              <span className="kw-pat-ripple"/><span className="kw-pat-glint">✧</span>
+            </span>}
+            {anim==='feed'&&<span className="kw-interaction-art kw-feed" aria-hidden="true">
+              <svg className="kw-snack" viewBox="0 0 48 48"><circle cx="24" cy="24" r="19" fill="#eec18a" stroke="#966b43" strokeWidth="2.5"/><path d="M14 16h3m11-4h3m2 18h3m-20 3h3m5-12h3" stroke="#916243" strokeWidth="4" strokeLinecap="round"/><circle cx="31" cy="23" r="2" fill="#fff1d4"/></svg>
+              <span className="kw-crumb kw-crumb-one"/><span className="kw-crumb kw-crumb-two"/><span className="kw-crumb kw-crumb-three"/>
+            </span>}
+          </span>}
           <span className="kw-pet-caption"><span className="kw-dot"/>{data?.companion.name||'伙伴'} · {offline?'离线':data?.settings.quiet?'安静陪伴':data?.companion.mood||'平静'}{collapsed?' · 展开':''}</span>
         </button>
         {!collapsed&&<button className="kw-collapse" type="button" title="收起" aria-label="收起伙伴" onClick={toggle}>−</button>}
-        {menu&&!collapsed&&<div className="kw-overlay-menu" style={menuStyle} aria-label="伙伴互动"><strong>{data?.companion.name||'伙伴'}</strong><div className="kw-row"><button type="button" disabled={!data||!!offline} onClick={()=>void interact('pet')}>摸摸</button><button type="button" disabled={!data||!!offline} onClick={()=>void interact('feed')}>喂食</button><button type="button" onClick={()=>{setMenu(false);openPanel(ctx,'chat');}}>聊聊</button><button type="button" disabled={!data||!!offline} onClick={()=>{if(data)void act('settings',{patch:{quiet:!data.settings.quiet}}).then(()=>setBubble(data.settings.quiet?'已恢复主动联系。':'已开启安静陪伴。')).catch(e=>setBubble(formatError(e)));}}>{data?.settings.quiet?'恢复关心':'安静陪我'}</button><button type="button" onClick={()=>{setMenu(false);openPanel(ctx,'settings');}}>设置</button><button type="button" onClick={()=>{const p=defaultPosition();setPos(p);write(KEY_POSITION,p);}}>重置位置</button></div></div>}
-        {bubble&&<div className="kw-bubble" role="status" aria-live="polite" style={menuStyle}><span>{bubble}</span>{data?.unread? <button type="button" onClick={()=>{setBubble('');openPanel(ctx,'chat');}}>聊聊</button>:null}<button type="button" aria-label="关闭提示" onClick={()=>setBubble('')}>×</button></div>}
+        {menu&&!collapsed&&<div className="kw-overlay-menu" style={menuStyle} aria-label="伙伴互动"><strong>{data?.companion.name||'伙伴'}</strong><div className="kw-row"><button type="button" disabled={!data||!!offline||interacting||!!anim} onClick={()=>void interact('pet')}>摸摸</button><button type="button" disabled={!data||!!offline||interacting||!!anim} onClick={()=>void interact('feed')}>喂食</button><button type="button" onClick={()=>{showPanel('chat');}}>聊聊</button><button type="button" disabled={!data||!!offline} onClick={()=>{if(data)void act('settings',{patch:{quiet:!data.settings.quiet}}).then(()=>setBubble(data.settings.quiet?'已恢复主动联系。':'已开启安静陪伴。')).catch(e=>setBubble(formatError(e)));}}>{data?.settings.quiet?'恢复关心':'安静陪我'}</button><button type="button" onClick={()=>{showPanel('settings');}}>设置</button><button type="button" onClick={()=>{const p=defaultPosition();setPos(p);write(KEY_POSITION,p);}}>重置位置</button></div></div>}
+        {bubble&&<div className="kw-bubble" role="status" aria-live="polite" style={menuStyle}><span>{bubble}</span>{data?.unread? <button type="button" onClick={()=>{showPanel('chat');}}>聊聊</button>:null}<button type="button" aria-label="关闭提示" onClick={()=>setBubble('')}>×</button></div>}
       </div>;
     }
     function Icon(){return <svg className="kw-sidebar-icon" viewBox="0 0 24 24" aria-label="伙伴"><path d="M4 13c0-4 3-7 8-7s8 3 8 7c0 3-3 6-8 6s-8-2-8-6Z"/><path d="M20 11c1-2 2-2 2-2m-2 5 2 1M8 12h.01M15 12h.01M10 15c1 1 3 1 4 0M12 6c0-2-1-3-2-3m2 3c0-2 1-3 2-3" strokeLinecap="round"/></svg>;}
-    return {inject:['slots'], apply(ctx:any) {
+    return {inject:['slots','layout'], apply(ctx:any) {
       ctx.slots.inject('main',()=>ctx.slots.register({name:'main',key:PANEL,registrant:'dsh-keep-whale'},()=>React.createElement(Page,{ctx})));
       ctx.slots.inject('sidebar.panellist',()=>ctx.slots.register({name:'sidebar.panellist',id:PANEL,order:40,label:()=> '陪伴伙伴',registrant:'dsh-keep-whale'},Icon));
       ctx.slots.inject('shell.overlay',()=>ctx.slots.register({name:'shell.overlay',id:PANEL,order:40,registrant:'dsh-keep-whale'},()=>React.createElement(Overlay,{ctx})));
