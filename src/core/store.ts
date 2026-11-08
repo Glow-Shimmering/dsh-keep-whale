@@ -54,7 +54,7 @@ export class Store {
     const columns = this.db.prepare('PRAGMA table_info(ledger)').all();
     if (!columns.some(column => column.name === 'unit')) this.db.exec("ALTER TABLE ledger ADD COLUMN unit TEXT NOT NULL DEFAULT ''");
     this.transaction(() => {
-      if (!this.getMeta<Companion>('companion')) this.setMeta('companion', { id: randomUUID(), name: '小鲸鱼', mood: '平静', createdAt: this.clock() } satisfies Companion);
+      if (!this.getMeta<Companion>('companion')) this.setMeta('companion', { id: randomUUID(), name: '大肥鱼', mood: '平静', createdAt: this.clock() } satisfies Companion);
       if (!this.getMeta<Settings>('settings')) this.setMeta('settings', DEFAULT_SETTINGS);
       if (this.getMeta<number>('revision') === undefined) this.setMeta('revision', 0);
       if (this.getMeta<number>('readAt') === undefined) this.setMeta('readAt', 0);

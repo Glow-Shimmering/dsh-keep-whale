@@ -19,7 +19,7 @@ node scripts/install.mjs \
   --profile "$HOME/.dsh/profiles/desktop" \
   --data-home "$HOME/.dsh" \
   --backup-dir "$HOME/dsh-backups/keep-whale-first-install" \
-  --name 小鲸鱼 --confirm-stopped
+  --name 大肥鱼 --confirm-stopped
 ```
 
 三个路径参数都须为绝对路径；`--data-home` 指 DSH_HOME，插件数据会放在其下的 `dsh-keep-whale` 目录。`--confirm-stopped` 表示你已确认 DSH 退出；脚本也检查旧插件的进程锁，若仍运行则停止。

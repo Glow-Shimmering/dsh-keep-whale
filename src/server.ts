@@ -17,7 +17,7 @@ export function createHandler(service:Service,assetUrl:URL) {
       const path=new URL(req.url||'','http://localhost').pathname.replace(/^\/keep-whale/,'');
       if(req.method==='GET'&&path==='/messages'){const before=new URL(req.url||'','http://localhost').searchParams.get('before')||undefined;const messages=service.store.messagePage(before);return send({messages,hasMore:messages.length===100});}
       if(req.method==='GET'&&path==='/state')return send({...service.snapshot(),token});
-      if(req.method==='GET'&&path==='/whale.svg'){res.writeHead(200,{'content-type':'image/svg+xml','cache-control':'public, max-age=3600','x-content-type-options':'nosniff'});return res.end(readFileSync(assetUrl));}
+      if(req.method==='GET'&&path==='/portrait.png'){res.writeHead(200,{'content-type':'image/png','cache-control':'public, max-age=3600','x-content-type-options':'nosniff'});return res.end(readFileSync(assetUrl));}
       if(req.method==='GET'&&path.startsWith('/media/')){const m=service.media.bytes(path.slice(7));res.writeHead(200,{'content-type':m.ref.mediaType,'cache-control':'private, max-age=3600','x-content-type-options':'nosniff'});return res.end(m.bytes);}
       if(req.method!=='POST')return send({error:'没有这个入口'},404);
       if(req.headers['x-keep-whale-token']!==token)return send({error:'连接已更新，请刷新后重试'},403);

@@ -31,7 +31,7 @@ const serverFixture = () => {
     store: { messagePage: (before?: string) => { state.before = before; return Array.from({ length: state.count }, (_, i) => ({ id: 'm' + i })); }, patchSettings: () => {} },
     media: { upload: async () => ({ url: '/example' }), bytes: () => ({ ref: { mediaType: 'image/png' }, bytes: Buffer.from([1]) }) },
   };
-  return { state, create: () => createHandler(service, new URL('../public/whale.svg', import.meta.url)) };
+  return { state, create: () => createHandler(service, new URL('../public/whale-girl.png', import.meta.url)) };
 };
 
 test('server rejects cross-site, foreign origins and malformed host; supports app and matching origin', async () => {

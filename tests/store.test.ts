@@ -22,7 +22,12 @@ test('identity is stable across rename and reopen and raw data is isolated', () 
   const env = setup();
   try {
     const id = env.store.companion().id;
+    assert.equal(env.store.companion().name, '大肥鱼');
+    env.store.addSource(source('identity-memory-source', env.clock()));
+    const memory = env.store.saveMemory({ kind: 'user_fact', text: '一条已有记忆', sourceIds: ['identity-memory-source'] });
+    assert.ok(memory);
     env.store.rename('小余'); env.store.setMood('平静');
+    assert.equal(env.store.memories()[0].id, memory.id);
     assert.equal(env.store.companion().id, id);
     assert.equal(env.store.settings().observeEnabled, false);
     assert.throws(() => env.store.rename(' '.repeat(3)));
