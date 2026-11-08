@@ -1,5 +1,7 @@
 import type { ImageRef, Ledger, Memory, Message, ModelInfo, Settings, Snapshot } from '../types.js';
 import css from './style.css';
+import chatCss from './chat.css';
+import { createMessageText } from './markdown.js';
 
 declare global {
   interface Window { __ModuleLoader__: { load(options: { id: string; factory: (require: (name: string) => any) => object }): void } }
@@ -9,7 +11,8 @@ window.__ModuleLoader__.load({
   id: 'dsh-keep-whale',
   factory(require) {
     const React = require('react') as typeof import('react');
-    const { useState, useEffect, useRef, useCallback } = React;
+    const { useState, useEffect, useLayoutEffect, useRef, useCallback } = React;
+    const MessageText=createMessageText(React);
     const PANEL = 'dsh-keep-whale';
     const PREFIX = '/keep-whale';
     const KEY_POSITION = 'dsh-keep-whale:position';
@@ -147,7 +150,12 @@ window.__ModuleLoader__.load({
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
-    function Chat({data, report}: {data:Snapshot; report:(s:string)=>void}) {
+    type ChatIconName = 'plus'|'send'|'stop'|'copy'|'retry'|'down'|'more'|'close'|'back';
+    function ChatIcon({name}: {name:ChatIconName}) {
+      const paths:Record<ChatIconName,string>={plus:'M12 5v14M5 12h14',send:'m6 11 6-6 6 6M12 5v14',stop:'M6 6h12v12H6z',copy:'M9 5V3h11v13h-2M4 7h11v14H4z',retry:'M4 10a8 8 0 1 1 1 8M4 4v6h6',down:'m6 9 6 6 6-6',more:'M5 12h.01M12 12h.01M19 12h.01',close:'m6 6 12 12M18 6 6 18',back:'m14 6-6 6 6 6'};
+      return <svg className="kw-chat-icon" viewBox="0 0 24 24" fill={name==='stop'?'currentColor':'none'} stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]}/></svg>;
+    }
+    function Chat({data, report, active, openSettings}: {data:Snapshot; report:(s:string)=>void; active:boolean; openSettings:()=>void}) {
       const [text,setText] = useState('');
       const [images,setImages] = useState<ImageRef[]>([]);
       const [uploading,setUploading] = useState(false);
@@ -155,12 +163,19 @@ window.__ModuleLoader__.load({
       const [older,setOlder] = useState<Message[]>([]);
       const [hasMore,setHasMore] = useState(data.messages.length >= 200);
       const [loadingHistory,setLoadingHistory] = useState(false);
+      const [atBottom,setAtBottom] = useState(true);
+      const [copied,setCopied] = useState<string|null>(null);
       const previousSnapshot = useRef({revision:data.revision,messages:data.messages});
-      const anchor = useRef<HTMLDivElement>(null);
+      const viewport = useRef<HTMLDivElement>(null), editor = useRef<HTMLTextAreaElement>(null);
+      const follow = useRef(true), restoreScroll = useRef<{height:number;top:number}|null>(null);
+      const copyTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
       const request = useRef<string | null>(null);
-      const selectedImageIds = images.map(image => image.id);
+      const requestPending = useRef(false);
       const latestIds = new Set(data.messages.map(message => message.id));
       const list = [...older.filter(message => !latestIds.has(message.id)), ...data.messages];
+      const modelName=data.models.find(m=>routeKey(m)===routeKey(data.settings.model))?.name || data.settings.model?.model || '选择模型';
+      const portrait=data.settings.skin||`${PREFIX}/portrait.png`;
+      useEffect(()=>()=>{if(copyTimer.current)clearTimeout(copyTimer.current);},[]);
       useEffect(() => {
         const previous=previousSnapshot.current;
         if(previous.revision!==data.revision) { setOlder([]); setHasMore(data.messages.length>=200); }
@@ -171,57 +186,98 @@ window.__ModuleLoader__.load({
         }
         previousSnapshot.current={revision:data.revision,messages:data.messages};
       }, [data.revision,data.messages]);
-      useEffect(() => { if (document.visibilityState === 'visible' && panelIsOpen && data.unread) void act('read').catch(() => {}); }, [data.unread]);
-      useEffect(() => { anchor.current?.scrollIntoView({block:'end'}); }, [data.messages.length, data.messages.at(-1)?.id, data.messages.at(-1)?.text]);
+      useEffect(() => { if (active && document.visibilityState === 'visible' && data.unread) void act('read').catch(() => {}); }, [active,data.unread]);
+      const jumpToLatest=()=>{follow.current=true;setAtBottom(true);const v=viewport.current;if(v)v.scrollTop=v.scrollHeight;};
+      useLayoutEffect(()=>{
+        if(!active)return;
+        const v=viewport.current;if(!v)return;
+        if(restoreScroll.current){v.scrollTop=restoreScroll.current.top+v.scrollHeight-restoreScroll.current.height;restoreScroll.current=null;}
+        else if(follow.current)v.scrollTop=v.scrollHeight;
+      },[active,list.length,list.at(-1)?.text,list.at(-1)?.status,loadingHistory]);
+      useLayoutEffect(()=>{const field=editor.current;if(!field||!active)return;field.style.height='auto';field.style.height=`${Math.min(field.scrollHeight,180)}px`;},[text,active]);
       const loadHistory=async()=>{
         const before=list[0]?.id; if(!before||loadingHistory)return; setLoadingHistory(true); report('');
         try {
           const response=await fetch(`${PREFIX}/messages?before=${encodeURIComponent(before)}`,{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(9000)});
           const result=await response.json(); if(!response.ok)throw new Error(result.error||'暂时无法读取更早的聊天');
           if(!Array.isArray(result.messages)||typeof result.hasMore!=='boolean')throw new Error('聊天历史格式无效');
+          const v=viewport.current;if(v)restoreScroll.current={height:v.scrollHeight,top:v.scrollTop};
+          follow.current=false;
           setOlder(current=>{const seen=new Set(current.map(x=>x.id));return [...result.messages.filter((x:Message)=>!seen.has(x.id)),...current];});
           setHasMore(result.hasMore);
         }catch(e){report(formatError(e));}finally{setLoadingHistory(false);}
       };
       const addFiles = async (files: File[]) => {
-        if (!files.length || uploading) return;
+        if (!files.length || uploading || requestPending.current) return;
         if (!data.capability.images) { report('当前模型没有确认图片能力，请在设置中选择支持图片的模型。'); return; }
         if (files.length + images.length > 4) { report('每次最多发送 4 张图片。'); return; }
         setUploading(true); report('');
         try {
           const added: ImageRef[] = [];
           for (const file of files) added.push(await upload(file,'image'));
-          setImages(old => [...old,...added]);
+          setImages(old => [...old,...added]);request.current=null;
         } catch (e) { report(formatError(e)); }
         finally { setUploading(false); }
       };
       const submit = async () => {
-        if (pending || data.busy || uploading || (!text.trim() && !images.length)) return;
-        setPending(true); report('');
+        if (requestPending.current || data.busy || uploading || (!text.trim() && !images.length)) return;
+        requestPending.current=true;setPending(true); report('');
         const requestId = request.current || createId(); request.current = requestId;
-        try { await act('chat', {requestId,text:text.trim(),imageIds:selectedImageIds}); setText(''); setImages([]); request.current=null; }
+        try { await act('chat', {requestId,text:text.trim(),imageIds:images.map(image=>image.id)}); setText(''); setImages([]); request.current=null;jumpToLatest();editor.current?.focus(); }
         catch (e) { report(formatError(e)); }
-        finally { setPending(false); }
+        finally { requestPending.current=false;setPending(false); }
       };
-      return <div className="kw-stack">
-        <div className="kw-heading"><div><h2>和 {data.companion.name} 聊聊</h2><small>这是一间独立的陪伴聊天，普通 DSH 对话仍由 DeepSeek 回答。</small></div><button type="button" disabled={!list.length} onClick={() => { if (window.confirm('删除当前显示的问答及其对应回复？相关的记忆依据也会撤回。')) void act('messages.delete',{ids:list.map(x=>x.id),confirm:true}).then(()=>{setOlder([]);setHasMore(true);}).catch(e=>report(formatError(e))); }}>删除当前显示的聊天</button></div>
-        <div className="kw-scroll" aria-label="聊天消息">
-          {hasMore&&list.length>0&&<div className="kw-row"><button type="button" disabled={loadingHistory} onClick={()=>void loadHistory()}>{loadingHistory?'正在读取…':'加载更早的聊天'}</button></div>}
-          {list.length===0 && <div className="kw-empty">这里还没有聊天记录。<br/><small>不用发送角色设定，自然地开始吧。</small></div>}
-          {list.map(m => <article key={m.id} className={`kw-message ${m.role==='user'?'kw-user':''}`}>
-            <p>{m.text || (m.status === 'streaming' ? '正在想…' : '')}</p>
-            {!!m.images.length && <div className="kw-images">{m.images.map(img => <a key={img.id} href={img.url} target="_blank" rel="noreferrer"><img src={img.url} alt={img.name}/></a>)}</div>}
-            <small>{m.role==='user'?'你':data.companion.name} · {date(m.createdAt)}{m.origin==='proactive'?' · 主动分享':''}{m.status==='streaming'?' · 正在回复…':m.status==='failed'?' · 回复未完成':m.status==='cancelled'?' · 已停止':''}</small>
-            {m.error && <small className="kw-danger">{m.error}</small>}
-            {(m.status==='failed' || m.status==='cancelled') && <button type="button" disabled={data.busy} onClick={() => { void act('retry',{messageId:m.id,requestId:createId()}).catch(e=>report(formatError(e))); }}>重试</button>}
-          </article>)}<div ref={anchor}/>
+      const retryMessage=async(message:Message)=>{
+        if(requestPending.current||data.busy)return;
+        requestPending.current=true;setPending(true);report('');follow.current=true;
+        try {await act('retry',{messageId:message.id});}
+        catch(e){report(formatError(e));}
+        finally {requestPending.current=false;setPending(false);}
+      };
+      const copyMessage=async(message:Message)=>{
+        try {await navigator.clipboard.writeText(message.text);setCopied(message.id);if(copyTimer.current)clearTimeout(copyTimer.current);copyTimer.current=setTimeout(()=>setCopied(null),1800);}
+        catch {report('暂时无法复制，请选中文字复制。');}
+      };
+      const clearVisible=()=>{
+        if(data.busy)return;
+        if(window.confirm('删除已加载的问答及对应回复？相关记忆依据也会撤回。'))void act('messages.delete',{ids:list.map(x=>x.id),confirm:true}).then(()=>{setOlder([]);setHasMore(true);}).catch(e=>report(formatError(e)));
+      };
+      return <div className="kw-chat-view" hidden={!active}>
+        <div className="kw-chat-history" ref={viewport} aria-label="聊天消息" onScroll={()=>{const v=viewport.current;if(!v)return;const near=v.scrollHeight-v.scrollTop-v.clientHeight<96;follow.current=near;setAtBottom(near);}} onLoad={()=>{if(follow.current)jumpToLatest();}}>
+          <div className="kw-chat-transcript">
+            <div className="kw-history-tools">
+              {hasMore&&list.length>0&&<button className="kw-text-button" type="button" disabled={loadingHistory} onClick={()=>void loadHistory()}>{loadingHistory?'正在读取…':'加载更早的聊天'}</button>}
+              {!!list.length&&<details className="kw-chat-menu"><summary aria-label="聊天管理" title="聊天管理"><ChatIcon name="more"/></summary><div><button type="button" className="kw-danger" disabled={data.busy} onClick={clearVisible}>删除已加载的聊天</button></div></details>}
+            </div>
+            {list.length===0 && <div className="kw-chat-welcome"><img src={portrait} alt=""/><h2>{data.companion.name}在这里</h2><p>今天想聊些什么？</p></div>}
+            {list.map(m => <article key={m.id} className={`kw-chat-message kw-chat-${m.role}`} aria-label={`${m.role==='user'?'你':data.companion.name}的消息`}>
+              {m.role==='assistant'&&<img className="kw-message-avatar" src={portrait} alt={data.companion.name}/>}
+              <div className="kw-message-main">
+                {m.role==='assistant'&&<div className="kw-reply-heading"><strong>{data.companion.name}</strong>{m.origin==='proactive'&&<span>主动分享</span>}{m.status==='streaming'&&<span className="kw-stream-status" role="status">正在回复<span className="kw-typing-dots" aria-hidden="true"><i/><i/><i/></span></span>}</div>}
+                <div className="kw-message-content">{m.text&&<MessageText text={m.text} role={m.role}/>}{!m.text&&m.status==='streaming'&&<span className="kw-thinking">让我想一想…</span>}
+                  {!!m.images.length && <div className="kw-chat-images">{m.images.map(img => <a key={img.id} href={img.url} target="_blank" rel="noreferrer"><img src={img.url} alt={img.name}/></a>)}</div>}
+                </div>
+                {m.error && <p className="kw-message-error" role="status">{m.error}</p>}
+                <footer className="kw-message-footer"><time dateTime={new Date(m.createdAt).toISOString()} title={date(m.createdAt)}>{new Date(m.createdAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</time>
+                  {m.status==='failed'?<span>回复未完成</span>:m.status==='cancelled'?<span>已停止</span>:null}
+                  {m.text&&<button className="kw-icon-button" type="button" aria-label={copied===m.id?'已复制':'复制消息'} title={copied===m.id?'已复制':'复制'} onClick={()=>void copyMessage(m)}><ChatIcon name="copy"/>{copied===m.id&&<span>已复制</span>}</button>}
+                  {(m.status==='failed' || m.status==='cancelled') && <button className="kw-text-button" type="button" disabled={pending||data.busy} onClick={() => void retryMessage(m)}><ChatIcon name="retry"/>重试</button>}
+                </footer>
+              </div>
+            </article>)}
+          </div>
         </div>
-        <form className="kw-compose" onSubmit={event => {event.preventDefault(); void submit();}}>
-          <textarea aria-label="聊天内容" placeholder={`对${data.companion.name}说些什么…`} value={text} onChange={e=>{setText(e.target.value);request.current=null;}} onPaste={e=>{const files=Array.from(e.clipboardData.files).filter(f=>f.type.startsWith('image/')); if(files.length){e.preventDefault();void addFiles(files);}}} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void submit();}}}/>
-          {images.length > 0 && <div className="kw-row">{images.map(image=><span className="kw-chip" key={image.id}>{image.name}<button type="button" aria-label={`移除${image.name}`} onClick={()=>{setImages(old=>old.filter(x=>x.id!==image.id));request.current=null;}}>×</button></span>)}</div>}
-          <div className="kw-row kw-between"><label className="kw-file">{uploading?'正在上传…':'添加图片'}<input type="file" accept="image/png,image/jpeg,image/webp" multiple disabled={uploading || images.length>=4 || !data.capability.images} onChange={e=>{void addFiles(Array.from(e.target.files || []));e.target.value='';}}/></label><small>Enter 发送 · Shift + Enter 换行</small><div className="kw-row">{data.busy && <button type="button" onClick={()=>{void act('cancel').catch(e=>report(formatError(e)));}}>停止回复</button>}<button className="kw-primary" type="submit" disabled={pending||data.busy||uploading||(!text.trim()&&!images.length)||!data.capability.chat}>发送</button></div></div>
-          {!data.capability.chat && <small>请先到设置中选择 DSH 已配置的模型。</small>}
-        </form>
+        <div className="kw-composer-dock">
+          {!atBottom&&<button className="kw-jump-latest" type="button" onClick={jumpToLatest}><ChatIcon name="down"/>回到最新</button>}
+          <form className="kw-chat-composer" onSubmit={event => {event.preventDefault(); void submit();}}>
+            {images.length > 0 && <div className="kw-attachment-tray">{images.map(image=><div className="kw-attachment" key={image.id}><img src={image.url} alt={image.name}/><span>{image.name}</span><button type="button" className="kw-icon-button" aria-label={`移除${image.name}`} disabled={pending} onClick={()=>{setImages(old=>old.filter(x=>x.id!==image.id));request.current=null;}}><ChatIcon name="close"/></button></div>)}</div>}
+            <textarea ref={editor} aria-label="聊天内容" placeholder={`给${data.companion.name}发消息…`} rows={2} value={text} disabled={pending} onChange={e=>{setText(e.target.value);request.current=null;}} onPaste={e=>{const files=Array.from(e.clipboardData.files).filter(f=>f.type.startsWith('image/')); if(files.length){e.preventDefault();const pasted=e.clipboardData.getData('text/plain');if(pasted){const field=e.currentTarget;setText(text.slice(0,field.selectionStart)+pasted+text.slice(field.selectionEnd));request.current=null;}void addFiles(files);}}} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void submit();}}}/>
+            <div className="kw-composer-toolbar"><div className="kw-composer-left"><label className={`kw-add-image ${uploading||!data.capability.images?'is-disabled':''}`} title={data.capability.images?'添加图片':'当前模型未确认图片能力'}><ChatIcon name="plus"/><input type="file" aria-label="添加图片" accept="image/png,image/jpeg,image/webp" multiple disabled={pending||uploading || images.length>=4 || !data.capability.images} onChange={e=>{void addFiles(Array.from(e.target.files || []));e.target.value='';}}/></label><span>{uploading?'正在上传…':'独立陪伴'}</span></div>
+              <div className="kw-composer-right"><button type="button" className="kw-model-button" title="模型与预算设置" onClick={openSettings}><span>{modelName}</span><ChatIcon name="down"/></button>{data.busy?<button className="kw-send-button is-stop" type="button" title="停止回复" aria-label="停止回复" onClick={()=>{void act('cancel').catch(e=>report(formatError(e)));}}><ChatIcon name="stop"/></button>:<button className="kw-send-button" type="submit" title="发送消息" aria-label="发送消息" disabled={pending||uploading||(!text.trim()&&!images.length)||!data.capability.chat}><ChatIcon name="send"/></button>}</div>
+            </div>
+          </form>
+          <div className="kw-composer-help">{!data.capability.chat?<button className="kw-text-button" type="button" onClick={openSettings}>选择模型后开始聊天</button>:<span>Enter 发送 · Shift + Enter 换行</span>}</div>
+        </div>
       </div>;
     }
 
@@ -345,13 +401,13 @@ window.__ModuleLoader__.load({
         return()=>{panelIsOpen=false;window.removeEventListener('dsh-keep-whale:tab',change);};
       },[]);
       useEffect(()=>{setError('');setNotice('');},[tab]);
-      const tabs:Array<[Tab,string]>=[['chat','聊聊'],['memory','记忆'],['activity','近况'],['settings','设置']];
-      return <div className="kw-root kw-main"><style>{css}</style><div className="kw-shell">
-        <header className="kw-header"><div><div className="kw-eyebrow">DSH Keep Whale</div><h1>{data?.companion.name || '陪伴伙伴'}</h1><p>一间属于你们的小空间</p></div><button type="button" onClick={()=>{try{selectPanel(ctx,null);}catch(e){setError(formatError(e));}}}>返回 DSH</button></header>
-        <nav className="kw-tabs" role="tablist" aria-label="伙伴面板">{tabs.map(([id,title])=><button key={id} type="button" role="tab" aria-selected={tab===id} onClick={()=>{setTab(id);nextTab=id;}}>{title}{id==='chat'&&!!data?.unread?` · ${data.unread}`:''}</button>)}</nav>
-        {offline && <p className="kw-error" role="status">{offline} {data && '下方是上次成功连接时的信息。'}</p>}
-        {(error||data?.error) && <p className="kw-error" role="alert">{error||data?.error}</p>}{notice && <p className="kw-notice" role="status">{notice}</p>}
-        {data ? tab==='chat'?<Chat data={data} report={setError}/>:tab==='memory'?<MemoryPage data={data} report={setError} notice={setNotice}/>:tab==='activity'?<Activity data={data} report={setError}/>:<SettingsPage data={data} report={setError} notice={setNotice}/> : <div className="kw-empty">正在连接伙伴服务…</div>}
+      const chooseTab=(value:Tab)=>{nextTab=value;setTab(value);};
+      const tabs:Array<[Tab,string]>=[['chat','对话'],['memory','记忆'],['activity','近况'],['settings','设置']];
+      return <div className="kw-root kw-main"><style>{css+chatCss}</style><div className="kw-shell">
+        <header className="kw-header"><div className="kw-title"><img src={data?.settings.skin||`${PREFIX}/portrait.png`} alt=""/><h1>{data?.companion.name || '陪伴伙伴'}</h1>{data&&<span className="kw-title-mood"><span className="kw-dot"/>{data.settings.quiet?'安静陪伴':data.companion.mood}</span>}</div><button className="kw-back" type="button" onClick={()=>{try{selectPanel(ctx,null);}catch(e){setError(formatError(e));}}}><ChatIcon name="back"/>返回 DSH</button></header>
+        <nav className="kw-tabs" role="tablist" aria-label="伙伴面板">{tabs.map(([id,title])=><button key={id} type="button" role="tab" aria-selected={tab===id} onClick={()=>chooseTab(id)}>{title}{id==='chat'&&!!data?.unread?` · ${data.unread}`:''}</button>)}</nav>
+        <div className="kw-page-notices">{offline && <p className="kw-error" role="status">{offline} {data && '下方是上次成功连接时的信息。'}</p>}{(error||data?.error) && <p className="kw-error" role="alert">{error||data?.error}</p>}{notice && <p className="kw-notice" role="status">{notice}</p>}</div>
+        {data ? <><Chat data={data} report={setError} active={tab==='chat'} openSettings={()=>chooseTab('settings')}/>{tab!=='chat'&&<div className="kw-page-body">{tab==='memory'?<MemoryPage data={data} report={setError} notice={setNotice}/>:tab==='activity'?<Activity data={data} report={setError}/>:<SettingsPage data={data} report={setError} notice={setNotice}/>}</div>}</> : <div className="kw-page-body"><div className="kw-empty">正在连接伙伴服务…</div></div>}
       </div></div>;
     }
 

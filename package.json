@@ -60,5 +60,8 @@
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"
   },
-  "icon": "public/whale-girl.png"
+  "icon": "public/whale-girl.png",
+  "dependencies": {
+    "marked": "18.1.3"
+  }
 }
