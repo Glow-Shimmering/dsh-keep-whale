@@ -1,0 +1,63 @@
+{
+  "name": "dsh-keep-whale",
+  "version": "0.1.0",
+  "description": "在 DeepSeek Harness 中拥有独立聊天、记忆和日常互动的陪伴伙伴。",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./dist/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "public",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.21.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Glow-Shimmering/dsh-keep-whale.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "companion",
+    "whale"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "verify": "npm run check && npm test && npm run build",
+    "prepack": "npm run build"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout"
+      ],
+      "external": [
+        "react"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "esbuild": "^0.25.0",
+    "react": "^19.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
