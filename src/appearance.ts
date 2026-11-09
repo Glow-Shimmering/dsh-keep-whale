@@ -1,10 +1,11 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
+import { validInteractionDuration, type AppearanceDurations } from './appearance-timing.js';
 
 /** Private appearance packs are local to one exact skin, never public assets. */
 export const APPEARANCE_FILES = ['calm.png','happy.png','expectant.png','worried.png','sad.png','annoyed.png','shy.png','relieved.png','pet.png','feed.png','pet.gif','feed.gif'] as const;
 type ArtName = typeof APPEARANCE_FILES[number];
-export type AppearanceStatus = { available: boolean; version: string | null };
+export type AppearanceStatus = { available: boolean; version: string | null; durations?: AppearanceDurations };
 const allowed = new Set<string>(APPEARANCE_FILES);
 const unavailable: AppearanceStatus = { available:false, version:null };
 const limit = 8 * 1024 * 1024;
@@ -36,7 +37,7 @@ export class Appearance {
     const info=lstatSync(this.dir);
     if(!info.isDirectory() || info.isSymbolicLink() || realpathSync(this.dir)!==join(realpathSync(this.root),'appearance'))throw new Error('invalid directory');
   }
-  private validate(skin:string|null):{version:string} {
+  private validate(skin:string|null):{version:string;durations:AppearanceDurations} {
     this.directory();
     const manifest=JSON.parse(readFile(join(this.dir,'manifest.json'),64*1024).toString('utf8'));
     if(!manifest || typeof manifest!=='object' || Array.isArray(manifest) || manifest.schemaVersion!==1 || typeof manifest.version!=='string' || !/^[A-Za-z0-9._-]{1,128}$/.test(manifest.version))throw new Error('invalid manifest');
@@ -44,13 +45,13 @@ export class Appearance {
     if(manifest.sourceSkin!==skin || !manifest.files || typeof manifest.files!=='object' || Array.isArray(manifest.files))throw new Error('wrong skin');
     const keys=Object.keys(manifest.files);
     if(keys.length!==APPEARANCE_FILES.length || keys.some(key=>!allowed.has(key)) || APPEARANCE_FILES.some(name=>manifest.files[name]!==name))throw new Error('invalid files');
-    if(manifest.durations?.pet!==2600 || manifest.durations?.feed!==3200)throw new Error('invalid durations');
+    if(!validInteractionDuration(manifest.durations?.pet) || !validInteractionDuration(manifest.durations?.feed))throw new Error('invalid durations');
     for(const name of APPEARANCE_FILES) if(!validSignature(name,readFile(join(this.dir,name),limit,true)))throw new Error('invalid image');
     this.directory();
-    return {version:manifest.version};
+    return {version:manifest.version,durations:{pet:manifest.durations.pet,feed:manifest.durations.feed}};
   }
   status(skin:string|null):AppearanceStatus {
-    try { const {version}=this.validate(skin);return {available:true,version}; }
+    try { const {version,durations}=this.validate(skin);return {available:true,version,durations}; }
     catch { return {...unavailable}; }
   }
   bytes(name:string,skin:string|null):{bytes:Buffer;mediaType:'image/png'|'image/gif'}|null {

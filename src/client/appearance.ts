@@ -1,12 +1,17 @@
+import { DEFAULT_INTERACTION_MS, validInteractionDuration, type InteractionAnimation, type AppearanceDurations } from '../appearance-timing.js';
 /** Pure display selection: showing an expression must never mutate persisted mood. */
 const MOODS: Readonly<Record<string,string>> = {
   平静: 'calm', 开心: 'happy', 期待: 'expectant', 担心: 'worried',
   沮丧: 'sad', 不满: 'annoyed', 害羞: 'shy', 释然: 'relieved',
 };
-export type InteractionAnimation = 'pet' | 'feed';
-export type Appearance = {available:boolean;version:string|null};
+export type { InteractionAnimation };
+export type Appearance = {available:boolean;version:string|null;durations?:AppearanceDurations};
 export type Position = {x:number; y:number};
-export const INTERACTION_MS: Readonly<Record<InteractionAnimation,number>> = {pet:2600,feed:3200};
+/** Older snapshots and unbound skins retain the original playback timing. */
+export function interactionDuration(type:InteractionAnimation,appearance?:Appearance|null):number {
+  const duration=appearance?.available ? appearance.durations?.[type] : undefined;
+  return validInteractionDuration(duration) ? duration : DEFAULT_INTERACTION_MS[type];
+}
 function versionQuery(appearance: Appearance): string { return `v=${encodeURIComponent(appearance.version || 'current')}`; }
 export function moodPortrait(mood?: string | null, customSkin?: string | null, appearance?: Appearance | null): string {
   if (!appearance?.available) return customSkin || '/keep-whale/portrait.png';

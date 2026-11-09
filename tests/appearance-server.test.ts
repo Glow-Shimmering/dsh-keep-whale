@@ -24,13 +24,21 @@ async function request(handler:ReturnType<typeof createHandler>,method:string,ur
 
 test('valid local pack returns only status and only for its currently bound skin',()=>{
  const f=fixture();try {
-  assert.deepEqual(f.appearance.status(sourceSkin),{available:true,version:'test-v1'});
+  assert.deepEqual(f.appearance.status(sourceSkin),{available:true,version:'test-v1',durations:{pet:2600,feed:3200}});
   assert.deepEqual(f.appearance.status(null),{available:false,version:null});
   assert.deepEqual(f.appearance.status('/keep-whale/media/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'),{available:false,version:null});
   assert.deepEqual(f.appearance.bytes('happy.png',sourceSkin),{bytes:png,mediaType:'image/png'});
   assert.deepEqual(f.appearance.bytes('feed.gif',sourceSkin),{bytes:gif,mediaType:'image/gif'});
   assert.equal(f.appearance.bytes('feed.gif',null),null);
   assert.equal(JSON.stringify(f.appearance.status(sourceSkin)).includes(f.root),false);
+ }finally{f.close();}
+});
+
+test('pack-specific bounded timings are returned without changing old pack behavior',()=>{
+ const f=fixture();try {
+  f.manifest.durations={pet:1800,feed:2200};f.save();
+  assert.deepEqual(f.appearance.status(sourceSkin),{available:true,version:'test-v1',durations:{pet:1800,feed:2200}});
+  f.manifest.durations={pet:600,feed:6000};f.save();assert.equal(f.appearance.status(sourceSkin).available,true);
  }finally{f.close();}
 });
 
@@ -45,7 +53,10 @@ test('invalid manifests, partial packs and invalid image signatures fail closed'
   (f:ReturnType<typeof fixture>)=>{f.manifest.files['happy.png']='../manifest.json';f.save();},
   (f:ReturnType<typeof fixture>)=>{f.manifest.files['private.txt']='private.txt';f.save();},
   (f:ReturnType<typeof fixture>)=>{delete f.manifest.files['happy.png'];f.save();},
-  (f:ReturnType<typeof fixture>)=>{f.manifest.durations.pet=999;f.save();},
+  (f:ReturnType<typeof fixture>)=>{f.manifest.durations.pet=599;f.save();},
+  (f:ReturnType<typeof fixture>)=>{f.manifest.durations.feed=6001;f.save();},
+  (f:ReturnType<typeof fixture>)=>{f.manifest.durations.pet=1800.5;f.save();},
+  (f:ReturnType<typeof fixture>)=>{delete f.manifest.durations;f.save();},
   (f:ReturnType<typeof fixture>)=>{f.manifest.sourceSkin='/keep-whale/media/../../private';f.save();},
   (f:ReturnType<typeof fixture>)=>unlinkSync(join(f.dir,'sad.png')),
   (f:ReturnType<typeof fixture>)=>writeFileSync(join(f.dir,'happy.png'),'not an image'),

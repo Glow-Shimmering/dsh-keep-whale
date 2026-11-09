@@ -3,7 +3,7 @@ import css from './style.css';
 import chatCss from './chat.css';
 import { createMessageText } from './markdown.js';
 import { budgetConfirmation, jobLedgerEntries, manualEmbeddingCalls, manualEmbeddingLabel, summarizeJobCosts } from './cost.js';
-import { moodPortrait, interactionPortrait, overlaySize as sizeForViewport, clampOverlay, toggleOverlayPosition, INTERACTION_MS } from './appearance.js';
+import { moodPortrait, interactionPortrait, interactionDuration, overlaySize as sizeForViewport, clampOverlay, toggleOverlayPosition } from './appearance.js';
 
 declare global {
   interface Window { __ModuleLoader__: { load(options: { id: string; factory: (require: (name: string) => any) => object }): void } }
@@ -404,7 +404,7 @@ window.__ModuleLoader__.load({
       const play=(type:'pet'|'feed')=>{
         if(timer.current)clearTimeout(timer.current);
         setPlaybackId(createId());setPreview(type);
-        timer.current=setTimeout(()=>{timer.current=null;setPreview(null);},INTERACTION_MS[type]);
+        timer.current=setTimeout(()=>{timer.current=null;setPreview(null);},interactionDuration(type,data.appearance));
       };
       const moods=['平静','开心','期待','担心','沮丧','不满','害羞','释然'];
       const src=interactionPortrait(data.companion.mood,data.settings.skin,data.appearance,preview,reduced,visible,playbackId);
@@ -543,7 +543,7 @@ window.__ModuleLoader__.load({
         actionPending.current=true;setInteracting(true);setMenu(false);setBubble('');setPlaybackId(createId());setAnim(type);
         if(dismiss.current)clearTimeout(dismiss.current);
         // Start on the click, not after the next state poll. No model is involved.
-        animationTimer.current=setTimeout(()=>{animationTimer.current=null;if(mounted.current)setAnim(null);},INTERACTION_MS[type]);
+        animationTimer.current=setTimeout(()=>{animationTimer.current=null;if(mounted.current)setAnim(null);},interactionDuration(type,data?.appearance));
         try {
           const result=await send('action',{action:'interaction',type,requestId:createId()});
           if(!mounted.current)return;
