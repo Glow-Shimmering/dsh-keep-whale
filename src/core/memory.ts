@@ -2,7 +2,7 @@
 const stop = new Set(['我','你','他','她','它','的','了','吗','呢','啊','是','在','和','与','也','都','有','这','那','什么','怎么','如何','是否','可以','请问','记得','我们','你们','他们','the','and','for','what','you','that','this','with','are']);
 export function searchTerms(text: string, index = false): string[] {
   const normalized = text.normalize('NFKC').toLocaleLowerCase();
-  const parts = normalized.match(/[\p{Script=Han}]+|[\p{L}\p{N}_]+/gu) ?? [];
+  const parts = normalized.match(/[\p{Script=Han}]+|(?:(?![\p{Script=Han}])[\p{L}\p{N}_])+/gu) ?? [];
   const result: string[] = [];
   for (const part of parts) {
     const chars = Array.from(part);
@@ -34,4 +34,9 @@ export function recencyWeight(at: number, now: number): number {
   const days = Math.max(0, now - at) / 86_400_000;
   return 0.3 + 0.7 * Math.pow(0.5, days / 30);
 }
-export function isHistoricalQuery(query: string): boolean { return /以前|过去|之前|当时|曾经|原来|那时|那时候|去年|上个月|histor(?:y|ical)|previous|formerly|used to/i.test(query); }
+export function isHistoricalQuery(query: string): boolean {
+  // A date cue permits old facts to be considered; it does not claim that the
+  // fact actually applied on that date. The model still receives timestamps.
+  const text=query.normalize('NFKC');
+  return /以前|过去|之前|当时|曾经|原来|那时|昨天|前天|前两天|上(?:上|一|个)?(?:周|星期|礼拜|月|季度|年)|去年|前年|(?:19|20)\d{2}年(?:\d{1,2}月(?:\d{1,2}[日号])?)?|(?:19|20)\d{2}[-/.]\d{1,2}(?:[-/.]\d{1,2})?|histor(?:y|ical)|previous|formerly|used to/i.test(text);
+}

@@ -90,11 +90,13 @@ export class Store {
       const schema = Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
       const count = Number(this.db.prepare('SELECT COUNT(*) AS n FROM memories').get()?.n ?? 0);
       const indexed = this.ftsAvailable ? Number(this.db.prepare('SELECT COUNT(*) AS n FROM memory_fts').get()?.n ?? 0) : count;
-      if (schema < 2 || indexed !== count) {
+      if (schema < 2 || indexed !== count || this.ftsAvailable && this.getMeta<number>('ftsTokenizerVersion') !== 1) {
+        if (this.ftsAvailable) this.db.exec('DELETE FROM memory_fts');
         for (const row of this.db.prepare('SELECT data FROM memories').all()) {
           const memory = parse<Memory>(row.data);
           this.reindexMemory(memory);
         }
+        if (this.ftsAvailable) this.setMeta('ftsTokenizerVersion',1);
         this.db.exec('PRAGMA user_version=2');
       }
     });

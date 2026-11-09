@@ -27,7 +27,7 @@ test('legacy migration creates recoverable pre-migration SQLite snapshot includi
     const files=readdirSync(root).filter(x=>x.startsWith('keep-whale.before-memory-network-')&&x.endsWith('.sqlite'));assert.equal(files.length,1);
     const backup=new DatabaseSync(join(root,files[0]),{readOnly:true});
     try {assert.equal(backup.prepare('SELECT COUNT(*) AS n FROM memories').get()!.n,1);assert.equal(backup.prepare('PRAGMA integrity_check').get()!.integrity_check,'ok');} finally {backup.close();}
-    store.close();const reopened=new Store(root,()=>1000);try {assert.equal(reopened.memories().length,1);assert.equal(readdirSync(root).filter(x=>x.startsWith('keep-whale.before-memory-network-')).length,1);} finally {reopened.close();}
+    store.close();old.exec("DELETE FROM meta WHERE key='ftsTokenizerVersion'; UPDATE memory_fts SET terms='outdatedtoken';");const reopened=new Store(root,()=>1000);try {assert.equal(reopened.memories().length,1);assert.ok(reopened.recall('旧事实').hits.some(h=>h.memory.id==='legacy'));assert.equal(readdirSync(root).filter(x=>x.startsWith('keep-whale.before-memory-network-')).length,1);} finally {reopened.close();}
   } finally {store.close();old.close();rmSync(root,{recursive:true,force:true});}
 });
 
@@ -150,6 +150,12 @@ test('removing the claim that superseded a fact restores its previous state and 
     const current=add(e.store,'new','现在喜欢绿茶',e.now());
     assert.ok(e.store.linkMemories({fromId:current.id,toId:old.id,kind:'updates',evidence:[{sourceId:'new',quote:'现在喜欢绿茶'}]}));
     assert.equal(e.store.memoryDetail(old.id)?.memory.status,'superseded');
+    // Historical cues expose superseded evidence for temporal reasoning; they
+    // do not assert that this synthetic fact applied on each quoted date.
+    for(const question of ['昨天喝红茶吗','前天喝红茶吗','上周喝红茶吗','2026年10月喝红茶吗','2026-10-02喝红茶吗']) {
+      assert.ok(e.store.recall(question).hits.some(hit=>hit.memory.id===old.id),question);
+    }
+    assert.ok(!e.store.recall('现在喝红茶吗').hits.some(hit=>hit.memory.id===old.id));
     e.store.deleteMemories([current.id]);
     assert.equal(e.store.memoryDetail(old.id)?.memory.status,'active');
     assert.ok(e.store.memoryDetail(old.id)!.history.length>0);
