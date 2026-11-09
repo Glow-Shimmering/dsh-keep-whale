@@ -121,7 +121,7 @@ test('model handles known-free route, missing usage, and truncated output with c
   const free = modelFixture([text, usage, finish('stop')], { free: true });
   try { assert.equal(await free.call('free'), '好'); assert.equal(free.store.usage().spent, 0); assert.equal(free.store.usage().uncertain, false); } finally { free.cleanup(); }
   const missing = modelFixture([text, finish('stop')]);
-  try { assert.equal(await missing.call('missing'), '好'); assert.equal(missing.store.usage().uncertain, true); assert.ok(missing.store.usage().reserved > 0); await assert.rejects(missing.call('again'), /未核实/); } finally { missing.cleanup(); }
+  try { assert.equal(await missing.call('missing'), '好'); assert.equal(missing.store.usage().uncertain, true); assert.ok(missing.store.usage().reserved > 0); assert.equal(await missing.call('again'), '好'); assert.equal(missing.store.ledger().length,2); } finally { missing.cleanup(); }
   const truncated = modelFixture([text, usage, finish('max-tokens')]);
   try { await assert.rejects(truncated.call('truncated'), (e: unknown) => e instanceof ModelFailure && e.code === 'TRUNCATED'); assert.ok(truncated.store.usage().spent > 0); assert.equal(truncated.store.usage().uncertain, false); } finally { truncated.cleanup(); }
 });

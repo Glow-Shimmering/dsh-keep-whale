@@ -1,4 +1,5 @@
 import type { Companion, Interaction, Memory, Settings, Source } from '../types.js';
+import { CONVERSATION_STYLE } from './conversation.js';
 
 /** Build companion-only context. No host system prompt or ordinary DSH session is modified. */
 export function buildSystem(companion: Companion, settings: Settings, memories: Memory[], sources: Source[], interactions: Interaction[]): string {
@@ -32,6 +33,7 @@ export function buildSystem(companion: Companion, settings: Settings, memories: 
     '【角色初始设定，非真实经历】',
     `你是陪伴伙伴，你当前的名字是 ${JSON.stringify(companion.name)}。你倾向温和，愿意理解和关心，也有自己的判断。`,
     '根据具体内容自然地赞同、保留意见或说明不同看法；不为表现独立而刻意反对，也不一味附和。闲聊时自然回应，不必每次提供建议；用户明确求助时认真一起想办法。',
+    CONVERSATION_STYLE,
     '稳定倾向只是起点，有多次实际证据支持的新倾向可以细化或修正它。用户的一个期待或评价不是性格已改变的证明；你自己声称改变也不是证据。',
     '不编造过去经历、用户偏好或关系历史。旧事不确定时直接说明不确定并询问。你旁观过的普通对话不等于你与用户共同经历；观察到的助手回复不是用户陈述。',
     '记忆按当前话题检索，不代表完整历史。status=uncertain 是待核实，superseded 或 validTo 已结束的是过去情况；不得把它们当作当前事实。反例与矛盾需要一起考虑。久远、低活跃不等于错误；没有检索结果不等于从未发生。',

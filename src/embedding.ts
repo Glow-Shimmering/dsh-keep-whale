@@ -5,6 +5,22 @@ import type { CostDetails, EmbeddingSettings, EmbeddingStatus, Memory } from './
 import type { Store } from './core/store.js';
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+// Ark vision embeddings use a fused multimodal request/response, even for text.
+// An explicit endpoint also supports deployments whose model ID is opaque (ep-*).
+function embeddingRequest(c: EmbeddingSettings) {
+  const url = new URL(c.endpoint);
+  let path = url.pathname.replace(/\/+$/, '');
+  const multimodal = path.endsWith('/embeddings/multimodal') || /^doubao-embedding-vision(?:-|$)/.test(c.model);
+  if (multimodal && !path && url.hostname === 'ark.cn-beijing.volces.com') path = '/api/v3';
+  if (multimodal) {
+    if (!path.endsWith('/embeddings/multimodal')) path = path.replace(/\/embeddings$/, '') + '/embeddings/multimodal';
+  } else if (!path.endsWith('/embeddings')) path += '/embeddings';
+  url.pathname = path;
+  return { url: url.href, multimodal };
+}
+// Only locally constructed diagnostics may cross the API boundary. Never echo
+// provider bodies, headers, URLs, or fetch errors, which may contain credentials.
+class EmbeddingFailure extends Error {}
 function validConfig(value: EmbeddingSettings): EmbeddingSettings {
   let endpoint: URL;
   try { endpoint = new URL(value.endpoint); } catch { throw new Error('嵌入服务地址无效'); }
@@ -14,6 +30,8 @@ function validConfig(value: EmbeddingSettings): EmbeddingSettings {
 }
 export function embeddingRouteKey(config: EmbeddingSettings): string {
   const c = validConfig(config);
+  const request = embeddingRequest(c);
+  if (request.multimodal) return hash(JSON.stringify([request.url, c.model, c.dimensions, 'ark-multimodal-v1']));
   return hash(JSON.stringify([c.endpoint, c.model, c.dimensions]));
 }
 type Secret = { apiKey: string; checked?: string };
@@ -72,32 +90,50 @@ export class Embeddings {
     const rawReserved=tokensBound*c.inputPrice/1e6;
     const details:CostDetails={provider:'embedding',model:c.model,rawUnit:c.unit,conversionRate,priceVerified:true,rawReserved};
     const ticket=this.store.reserve(opts.jobId,rawReserved*conversionRate,opts.background,details);
-    let dispatched=false, usage:number|null=null, vectors:number[][]|undefined, failed=false;
+    const request = embeddingRequest(c);
+    // Ark combines all input objects into one vector. Keep different memories
+    // in separate requests, but reserve and settle this job once in the ledger.
+    const batches = request.multimodal ? texts.map(text => [text]) : [texts];
+    let dispatched=false, usage:number|null=0, failure:Error|undefined;
+    const vectors:number[][]=[];
+    let signal:AbortSignal|undefined;
     try {
-      opts.signal?.throwIfAborted();
-      dispatched=true;
-      const base=c.endpoint.replace(/\/$/,'');
-      const signal=opts.signal ? AbortSignal.any([opts.signal,AbortSignal.timeout(60000)]) : AbortSignal.timeout(60000);
-      const response=await this.fetchImpl(base.endsWith('/embeddings')?base:base+'/embeddings',{method:'POST',redirect:'error',signal,headers:{'content-type':'application/json',authorization:`Bearer ${key}`},body:JSON.stringify({model:c.model,input:texts,dimensions:c.dimensions})});
-      if(!response.ok) throw new Error('嵌入服务请求失败');
-      const body:any=await response.json();
-      const prompt=body?.usage?.prompt_tokens, total=body?.usage?.total_tokens;
-      const valid=(n:unknown):n is number=>Number.isSafeInteger(n) && (n as number)>=0;
-      if(prompt!==undefined && !valid(prompt) || total!==undefined && !valid(total) || prompt!==undefined && total!==undefined && prompt!==total) throw new Error('嵌入服务用量不一致');
-      if(valid(prompt)) usage=prompt; else if(valid(total)) usage=total;
-      if(!Array.isArray(body?.data) || body.data.length!==texts.length) throw new Error('嵌入服务返回的数据不完整');
-      const ordered=Array<number[]>(texts.length), seen=new Set<number>();
-      for(const item of body.data) {
-        if(!Number.isInteger(item?.index)||item.index<0||item.index>=texts.length||seen.has(item.index)||!Array.isArray(item.embedding)||item.embedding.length!==c.dimensions||!item.embedding.every((n:unknown)=>typeof n==='number'&&Number.isFinite(n))||!item.embedding.some((n:number)=>n!==0)) throw new Error('嵌入服务返回的向量无效');
-        seen.add(item.index);ordered[item.index]=item.embedding;
+      signal=opts.signal ? AbortSignal.any([opts.signal,AbortSignal.timeout(60000)]) : AbortSignal.timeout(60000);
+      for (const batch of batches) {
+        signal.throwIfAborted();
+        const previousUsage:number|null = usage;
+        usage = null; // A dispatched request with no verified usage makes the job uncertain.
+        dispatched=true;
+        const response=await this.fetchImpl(request.url,{method:'POST',redirect:'error',signal,headers:{'content-type':'application/json',authorization:`Bearer ${key}`},body:JSON.stringify({model:c.model,input:request.multimodal?batch.map(text=>({type:'text',text})):batch,dimensions:c.dimensions,...request.multimodal?{encoding_format:'float'}:{}})});
+        if(!response.ok) {
+          const hints:Record<number,string>={400:'请求参数或模型与接口不匹配',401:'请检查 API 密钥',403:'请检查模型开通状态和访问权限',404:'请检查完整接口地址和模型名称',429:'请求过于频繁或额度不足'};
+          throw new EmbeddingFailure(`嵌入服务请求失败（HTTP ${response.status}）：${hints[response.status] || '请稍后重试'}`);
+        }
+        let body:any;
+        try { body=await response.json(); } catch { throw new EmbeddingFailure('嵌入服务返回格式无效：响应不是 JSON'); }
+        const prompt=body?.usage?.prompt_tokens, total=body?.usage?.total_tokens;
+        const valid=(n:unknown):n is number=>Number.isSafeInteger(n) && (n as number)>=0;
+        if(prompt!==undefined && !valid(prompt) || total!==undefined && !valid(total) || prompt!==undefined && total!==undefined && prompt!==total) throw new EmbeddingFailure('嵌入服务返回格式无效：用量字段不一致');
+        const currentUsage=valid(prompt)?prompt:valid(total)?total:null;
+        if(currentUsage===null) throw new EmbeddingFailure('嵌入服务未返回可核实用量，已暂停本次操作');
+        if(previousUsage===null || !Number.isSafeInteger(previousUsage+currentUsage)) throw new EmbeddingFailure('嵌入服务返回格式无效：累计用量无效');
+        usage=previousUsage+currentUsage;
+        const data=request.multimodal && body?.data && !Array.isArray(body.data) ? [{index:0,embedding:body.data.embedding}] : request.multimodal ? null : body?.data;
+        if(!Array.isArray(data) || data.length!==batch.length) throw new EmbeddingFailure('嵌入服务返回格式无效：向量结果数量不符');
+        const ordered=Array<number[]>(batch.length), seen=new Set<number>();
+        for(const item of data) {
+          if(!Number.isInteger(item?.index)||item.index<0||item.index>=batch.length||seen.has(item.index)||!Array.isArray(item.embedding)||!item.embedding.every((n:unknown)=>typeof n==='number'&&Number.isFinite(n))||!item.embedding.some((n:number)=>n!==0)) throw new EmbeddingFailure('嵌入服务返回格式无效：向量数据无效');
+          if(item.embedding.length!==c.dimensions) throw new EmbeddingFailure(`嵌入服务返回格式无效：配置为 ${c.dimensions} 维，实际返回 ${item.embedding.length} 维`);
+          seen.add(item.index);ordered[item.index]=item.embedding;
+        }
+        opts.signal?.throwIfAborted();
+        signal.throwIfAborted();
+        vectors.push(...ordered);
       }
-      opts.signal?.throwIfAborted();
-      signal.throwIfAborted();
-      vectors=ordered;
-    } catch { failed=true; }
+    } catch(e) { failure=e instanceof EmbeddingFailure?e:new EmbeddingFailure(opts.signal?.aborted?'嵌入请求已中断':signal?.aborted?'嵌入请求超时，请稍后重试':'嵌入服务暂时不可用或返回格式无效'); }
     const rawActual=!dispatched?0:usage===null?null:usage*c.inputPrice/1e6;
     this.store.settle(ticket,rawActual===null?null:rawActual*conversionRate,{rawActual,...usage===null?{}:{inputTokens:usage}});
-    if(failed||!vectors) throw new Error(opts.signal?.aborted?'嵌入请求已中断':'嵌入服务暂时不可用或返回格式无效');
+    if(failure) throw failure;
     if(usage===null) throw new Error('嵌入服务未返回可核实用量，已暂停本次操作');
     return vectors;
   }

@@ -152,36 +152,36 @@ test('interactions are idempotent, alternate lines, do not change mood or enqueu
   } finally { e.cleanup(); }
 });
 
-test('budget reserves atomically, tracks actual and uncertain cost; chat has separate budget', () => {
+test('Bilibili budget reserves atomically, tracks actual and uncertain cost; chat has separate budget', () => {
   const e = setup();
   try {
-    assert.throws(() => e.store.reserve('unpriced', 1, true), /价格|单价/);
+    assert.throws(() => e.store.reserve('unpriced', 1, true,undefined,'bilibili'), /价格|单价/);
     priced(e.store);
     const rev = e.store.revision();
-    const id = e.store.reserve('j1', 80, true);
-    assert.equal(e.store.reserve('j1', 80, true), id);
-    assert.throws(() => e.store.reserve('j2', 21, true), /预算/);
+    const id = e.store.reserve('j1', 80, true,undefined,'bilibili');
+    assert.equal(e.store.reserve('j1', 80, true,undefined,'bilibili'), id);
+    assert.throws(() => e.store.reserve('j2', 21, true,undefined,'bilibili'), /预算/);
     const chat = e.store.reserve('chat', 50, false); e.store.settle(chat, 40);
     assert.equal(e.store.usage().chatSpent, 40); assert.equal(e.store.usage().reserved, 80);
     e.store.settle(id, 30); assert.equal(e.store.usage().spent, 30);
-    const next = e.store.reserve('j3', 1, true); e.store.settle(next, null);
+    const next = e.store.reserve('j3', 1, true,undefined,'bilibili'); e.store.settle(next, null);
     assert.equal(e.store.usage().uncertain, true);
-    assert.throws(() => e.store.reserve('j4', 1, true), /未核实/);
+    assert.throws(() => e.store.reserve('j4', 1, true,undefined,'bilibili'), /未核实/);
     assert.equal(e.store.revision(), rev);
     e.advance(24 * 3600 * 1000); assert.equal(e.store.usage().spent, 0);
     assert.equal(e.store.usage().uncertain, false);
-    assert.doesNotThrow(() => e.store.reserve('j5', 1, true));
+    assert.doesNotThrow(() => e.store.reserve('j5', 1, true,undefined,'bilibili'));
   } finally { e.cleanup(); }
 });
 
-test('verified free model accepts zero reservation and missing usage still stops background', () => {
+test('verified free model accepts zero reservation and missing usage still stops Bilibili calls', () => {
   const e = setup();
   try {
     e.store.patchSettings({ model: { provider: 'free', model: 'model' }, priceRoute: { provider: 'free', model: 'model' }, prices: { input: 0, cached: 0, output: 0 } });
-    const id = e.store.reserve('free-1', 0, true); e.store.settle(id, 0);
+    const id = e.store.reserve('free-1', 0, true,undefined,'bilibili'); e.store.settle(id, 0);
     assert.equal(e.store.usage().spent, 0);
-    const id2 = e.store.reserve('free-2', 0, true); e.store.settle(id2, null);
-    assert.throws(() => e.store.reserve('free-3', 0, true), /未核实/);
+    const id2 = e.store.reserve('free-2', 0, true,undefined,'bilibili'); e.store.settle(id2, null);
+    assert.throws(() => e.store.reserve('free-3', 0, true,undefined,'bilibili'), /未核实/);
   } finally { e.cleanup(); }
 });
 
@@ -256,14 +256,14 @@ test('exceeding the reserved amount records actual spend and stops the day witho
   const e = setup();
   try {
     priced(e.store);
-    const ticket = e.store.reserve('overspend', 1, true); e.store.settle(ticket, 3);
+    const ticket = e.store.reserve('overspend', 1, true,undefined,'bilibili'); e.store.settle(ticket, 3);
     assert.equal(e.store.usage().spent, 3); assert.equal(e.store.usage().reserved, 0);
     assert.equal(e.store.usage().uncertain, true);
-    assert.throws(() => e.store.reserve('later', 1, true), /未核实/);
+    assert.throws(() => e.store.reserve('later', 1, true,undefined,'bilibili'), /未核实/);
     assert.doesNotThrow(() => e.store.settle(ticket, 3));
     e.advance(24 * 3600 * 1000);
     assert.equal(e.store.usage().uncertain, false);
-    assert.doesNotThrow(() => e.store.reserve('tomorrow', 1, true));
+    assert.doesNotThrow(() => e.store.reserve('tomorrow', 1, true,undefined,'bilibili'));
   } finally { e.cleanup(); }
 });
 

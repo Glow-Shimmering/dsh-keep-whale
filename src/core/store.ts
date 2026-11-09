@@ -7,6 +7,16 @@ import { searchTerms, indexText, cosine, recencyWeight, isHistoricalQuery } from
 import { interactionFeedback } from './interaction.js';
 
 const DAY_MS = 86_400_000;
+// Acknowledgment only changes budget admission. Original ledger facts stay intact,
+// and old versions that do not understand this metadata continue to pause safely.
+const BUDGET_ACK_JOIN = `LEFT JOIN meta budget_ack ON budget_ack.key='budget-ack:' || l.id
+  AND l.status='uncertain' AND json_extract(budget_ack.data,'$.day')=l.day
+  AND json_extract(budget_ack.data,'$.unit')=l.unit
+  AND json_extract(budget_ack.data,'$.amount')=COALESCE(l.actual,l.reserved)
+  AND json_extract(budget_ack.data,'$.at')>0`;
+// Only explicitly tagged future Bilibili calls use the spending limit. Existing
+// ledger rows remain untouched and are not silently reclassified as Bilibili.
+const BILIBILI_SCOPE = `EXISTS (SELECT 1 FROM meta budget_scope WHERE budget_scope.key='budget-scope:' || l.id AND json_extract(budget_scope.data,'$.kind')='bilibili')`;
 /** The product's budget and evidence day follows Beijing time, independent of host locale. */
 export function beijingDay(timestamp: number): string { return new Date(timestamp + 8 * 3_600_000).toISOString().slice(0, 10); }
 export const DEFAULT_SETTINGS: Settings = {
@@ -633,12 +643,16 @@ export class Store {
     this.db.prepare('UPDATE jobs SET data=? WHERE id=?').run(JSON.stringify(next), id); return next;
   }
   updateJob(id: string, patch: Partial<Job>): Job | undefined { return this.transaction(() => { const next = this.updateJobInside(id, patch); return next; }); }
-  reserve(jobId: string, amount: number, background: boolean, details?: CostDetails): string {
+  reserve(jobId: string, amount: number, background: boolean, details?: CostDetails, budgetScope?: 'bilibili'): string {
     bounded(jobId, '任务 ID', 200);
     if (!numberAtLeastZero(amount)) throw new Error('预留费用无效');
+    if (budgetScope!==undefined && (budgetScope!=='bilibili'||!background)) throw new Error('预算用途无效');
     return this.transaction(() => {
       const existing = this.db.prepare('SELECT id FROM ledger WHERE job_id=?').get(jobId);
-      if (existing) return String(existing.id);
+      if (existing) {
+        if(this.getMeta<{kind:string}>('budget-scope:'+existing.id)?.kind!==budgetScope) throw new Error('任务预算用途已变化，不能重复使用同一调用');
+        return String(existing.id);
+      }
       if (background) {
         const settings = this.settings();
         if (!settings.backgroundEnabled) throw new Error('后台任务未启用');
@@ -648,12 +662,15 @@ export class Store {
           if (!settings.prices || !sameRoute(settings.model, settings.priceRoute)) throw new Error('后台任务需要启用并为当前模型配置已核实单价');
           if (amount === 0 && Math.max(settings.prices.input, settings.prices.cached, settings.prices.output) !== 0) throw new Error('非免费线路不能零费用预留');
         }
-        const usage = this.usage();
-        if (usage.uncertain) throw new Error('存在未核实费用，后台任务已暂停');
-        if (usage.spent + usage.reserved + amount > settings.dailyLimit + 1e-9) throw new Error('今日后台预算不足');
+        if (budgetScope==='bilibili') {
+          const usage = this.usage(true);
+          if (usage.uncertain) throw new Error('存在未核实的 B 站费用，B 站任务已暂停');
+          if (usage.spent + (usage.estimated ?? 0) + usage.reserved + amount > settings.dailyLimit + 1e-9) throw new Error('今日 B 站预算不足');
+        }
       }
       const id = randomUUID();
       this.db.prepare("INSERT INTO ledger(id,day,job_id,background,unit,reserved,actual,status,created_at,details) VALUES(?,?,?,?,?,?,NULL,'reserved',?,?)").run(id, beijingDay(this.clock()), jobId, background ? 1 : 0, this.settings().unit, amount, this.clock(),details?JSON.stringify(details):null);
+      if(budgetScope) this.setMeta('budget-scope:'+id,{kind:budgetScope});
       return id;
     });
   }
@@ -665,24 +682,46 @@ export class Store {
         if (row.status === 'settled' && actual !== null && Number(row.actual) === actual || row.status === 'uncertain' && (actual === null && row.actual === null || actual !== null && row.actual !== null && Number(row.actual) === actual)) return;
         throw new Error('费用记录已结算，不能重复修改');
       }
-      const uncertain = actual === null || (!!row.background && actual > Number(row.reserved) + 1e-9);
+      const uncertain = actual === null || (this.getMeta<{kind:string}>('budget-scope:'+ticket)?.kind==='bilibili' && actual > Number(row.reserved) + 1e-9);
       const merged=details?{...(row.details?parse<CostDetails>(row.details):{}),...details}:row.details?parse<CostDetails>(row.details):null;
       if (row.details && actual!==null && (!merged || !numberAtLeastZero(merged.rawActual) || Math.abs(merged.rawActual*Number(merged.conversionRate)-actual)>1e-8)) throw new Error('实际费用与换算不一致');
       if (merged && [merged.inputTokens,merged.outputTokens,merged.cachedTokens].some(n=>n!==undefined && (!Number.isSafeInteger(n)||n<0))) throw new Error('模型用量无效');
       this.db.prepare('UPDATE ledger SET status=?,actual=?,details=? WHERE id=?').run(uncertain ? 'uncertain' : 'settled', actual, merged?JSON.stringify(merged):null, ticket);
     });
   }
-  ledger(): Ledger[] {
-    return this.db.prepare('SELECT * FROM ledger ORDER BY created_at DESC LIMIT 500').all().map(row => ({ unit:String(row.unit), id: String(row.id), day: String(row.day), jobId: String(row.job_id), background: !!row.background, reserved: Number(row.reserved), actual: row.actual === null ? null : Number(row.actual), status: row.status as Ledger['status'], createdAt: Number(row.created_at), ...(row.details?{details:parse<CostDetails>(row.details)}:{}) }));
+  private ledgerEntries(where:string,...params:Array<string|number>):Ledger[] {
+    return this.db.prepare(`SELECT l.*,${BILIBILI_SCOPE} AS bilibili,json_extract(budget_ack.data,'$.at') AS ack_at FROM ledger l ${BUDGET_ACK_JOIN} ${where}`).all(...params).map(row => ({ unit:String(row.unit), id: String(row.id), day: String(row.day), jobId: String(row.job_id), background: !!row.background, reserved: Number(row.reserved), actual: row.actual === null ? null : Number(row.actual), status: row.status as Ledger['status'], createdAt: Number(row.created_at), ...(row.details?{details:parse<CostDetails>(row.details)}:{}), ...(row.ack_at?{budgetAcknowledgedAt:Number(row.ack_at)}:{}), ...(row.bilibili?{budgetScope:'bilibili' as const}:{}) }));
   }
-  usage(): Usage {
+  ledger(): Ledger[] { return this.ledgerEntries('ORDER BY l.created_at DESC LIMIT 500'); }
+  budgetBlockers():Ledger[] {
+    return this.ledgerEntries(`WHERE l.background=1 AND ${BILIBILI_SCOPE} AND l.day=? AND l.unit=? AND l.status='uncertain' AND budget_ack.key IS NULL ORDER BY l.created_at DESC`,beijingDay(this.clock()),this.settings().unit);
+  }
+  acknowledgeBudget(id:string,day:string,unit:string,amount:number):Usage {
+    bounded(id,'费用记录 ID',200);
+    return this.transaction(()=>{
+      const row=this.db.prepare('SELECT * FROM ledger WHERE id=?').get(id);
+      if(!row||!row.background||this.getMeta<{kind:string}>('budget-scope:'+id)?.kind!=='bilibili'||row.status!=='uncertain'||day!==beijingDay(this.clock())||unit!==this.settings().unit||row.day!==day||row.unit!==unit||!numberAtLeastZero(amount)||amount!==Number(row.actual??row.reserved)) throw new Error('费用记录或预算已变化，请刷新后重新确认');
+      const jobId=String(row.job_id);
+      if(this.runningJobs().some(job=>jobId===job.id||jobId.startsWith(job.id+':attempt:')||jobId===job.id+':recall')) throw new Error('该任务仍在运行，请等待结束后核对费用');
+      const key='budget-ack:'+id;
+      const existing=this.getMeta<{at:number;day:string;unit:string;amount:number}>(key);
+      if(existing && (existing.day!==day||existing.unit!==unit||existing.amount!==amount||!Number.isFinite(existing.at)||existing.at<=0)) throw new Error('费用确认记录不一致，请核对后再处理');
+      if(!existing) this.setMeta(key,{at:this.clock(),day,unit,amount});
+      return this.usage(true);
+    });
+  }
+  hasUnknownCost(jobId:string):boolean {
+    return !!this.db.prepare("SELECT 1 FROM ledger WHERE job_id=? AND actual IS NULL AND status='uncertain'").get(jobId);
+  }
+  usage(budgetOnly=false): Usage {
     const day = beijingDay(this.clock());
     const settings = this.settings();
-    const row = this.db.prepare("SELECT COALESCE(SUM(CASE WHEN actual IS NOT NULL THEN actual ELSE 0 END),0) AS spent,COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') AND actual IS NULL THEN reserved ELSE 0 END),0) AS reserved FROM ledger WHERE background=1 AND day=? AND unit=?").get(day, settings.unit)!;
-    const uncertain = this.db.prepare("SELECT 1 FROM ledger WHERE background=1 AND day=? AND unit=? AND status='uncertain' LIMIT 1").get(day, settings.unit);
+    const scope=budgetOnly?` AND ${BILIBILI_SCOPE}`:'';
+    const row = this.db.prepare(`SELECT COALESCE(SUM(CASE WHEN l.actual IS NOT NULL THEN l.actual ELSE 0 END),0) AS spent,COALESCE(SUM(CASE WHEN l.status IN ('reserved','uncertain') AND l.actual IS NULL AND budget_ack.key IS NULL THEN l.reserved ELSE 0 END),0) AS reserved,COALESCE(SUM(CASE WHEN l.actual IS NULL AND budget_ack.key IS NOT NULL THEN l.reserved ELSE 0 END),0) AS estimated FROM ledger l ${BUDGET_ACK_JOIN} WHERE l.background=1 AND l.day=? AND l.unit=?${scope}`).get(day, settings.unit)!;
+    const uncertain = this.db.prepare(`SELECT 1 FROM ledger l ${BUDGET_ACK_JOIN} WHERE l.background=1 AND l.day=? AND l.unit=?${scope} AND l.status='uncertain' AND budget_ack.key IS NULL LIMIT 1`).get(day, settings.unit);
     const chat = this.db.prepare("SELECT COALESCE(SUM(actual),0) AS spent FROM ledger WHERE background=0 AND day=? AND unit=? AND status='settled'").get(day, settings.unit)!;
     const chatUncertain = this.db.prepare("SELECT 1 FROM ledger WHERE background=0 AND day=? AND unit=? AND status='uncertain' LIMIT 1").get(day, settings.unit);
-    return { day, spent: Number(row.spent), reserved: Number(row.reserved), uncertain: !!uncertain, chatSpent: Number(chat.spent), chatUncertain: !!chatUncertain, limit: settings.dailyLimit, unit: settings.unit };
+    return { day, spent: Number(row.spent), reserved: Number(row.reserved), estimated:Number(row.estimated), uncertain: !!uncertain, chatSpent: Number(chat.spent), chatUncertain: !!chatUncertain, limit: settings.dailyLimit, unit: settings.unit };
   }
   readAt(): number { return this.getMeta<number>('readAt') ?? 0; }
   markRead(): void { this.transaction(() => { this.setMeta('readAt', this.clock()); }); }

@@ -18,12 +18,68 @@ function setup() {
  return {root,store,service,ctx,calls,llm,setAnswer:(s:string)=>{answer=s;},setReason:(s:string)=>{reason=s;},withoutUsage:()=>{reportUsage=false;},close:async()=>{await service.dispose();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 const waitFor=async(fn:()=>boolean)=>{for(let i=0;i<100;i++){if(fn())return;await new Promise(r=>setTimeout(r,10));}assert.fail('task did not settle');};
+test('budget recovery requires explicit exact confirmation and makes no model request',async()=>{const x=setup();try{
+ const id=x.store.reserve('old-interrupted',.7197,true,undefined,'bilibili');x.store.settle(id,null);
+ const entry=x.store.budgetBlockers()[0];
+ const body={action:'billing.acknowledge',id,day:entry.day,unit:entry.unit,amount:entry.reserved};
+ await assert.rejects(x.service.action(body),/明确确认/);
+ await assert.rejects(x.service.action({...body,confirm:'true'}),/明确确认/);
+ await assert.rejects(x.service.action({...body,confirm:true,amount:0}),/已变化/);
+ assert.equal(x.store.usage().uncertain,true);
+ assert.equal(x.service.snapshot().budgetBlockers?.length,1);
+ x.store.patchSettings({backgroundEnabled:false});
+ await x.service.action({...body,confirm:true});
+ const ackAt=x.store.ledger()[0].budgetAcknowledgedAt;
+ await x.service.action({...body,confirm:true});assert.equal(x.store.ledger()[0].budgetAcknowledgedAt,ackAt);
+ assert.equal(x.store.usage().estimated,.7197);assert.equal(x.store.usage().spent,0);
+ assert.equal(x.store.ledger()[0].status,'uncertain');assert.equal(x.store.ledger()[0].actual,null);
+ assert.equal(x.service.snapshot().budgetBlockers?.length,0);
+ assert.equal(x.store.settings().backgroundEnabled,false);
+ await x.service.tick();assert.equal(x.calls.length,0);assert.equal(x.store.jobs().length,0);
+ }finally{await x.close();}});
+test('budget confirmation while a background request is active has no accounting effect',async()=>{const x=setup();let release:()=>void=()=>{};try{
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ x.llm.stream=async function*(options:any){x.calls.push(options);await gate;yield {type:'text-delta',text:JSON.stringify({memories:[]})};yield {type:'usage',usage:{inputTokens:200,outputTokens:80,cacheReadTokens:0,cacheWriteTokens:0}};yield {type:'finish',reason:{kind:'stop'}};};
+ x.store.addSource({id:'new',kind:'user_fact',text:'我喜欢茶',occasion:'new',createdAt:Date.now(),processed:false,revoked:false});
+ const running=x.service.tick();await waitFor(()=>x.calls.length===1);
+ const id=x.store.reserve('another-interrupted',.2,true,undefined,'bilibili');x.store.settle(id,null);const entry=x.store.budgetBlockers()[0];
+ const before=x.store.usage();
+ await assert.rejects(x.service.action({action:'billing.acknowledge',id,day:entry.day,unit:entry.unit,amount:.2,confirm:true}),/后台任务仍在运行/);
+ assert.deepEqual(x.store.usage(),before);assert.equal(x.store.ledger().find(row=>row.id===id)?.budgetAcknowledgedAt,undefined);
+ release();await running;assert.equal(x.calls.length,1);
+ }finally{release();await x.close();}});
+test('memory retry runs despite old unknown cost and zero Bilibili budget without altering old ledger',async()=>{const x=setup();try{
+ const id=x.store.reserve('old-interrupted',.7197,true);x.store.settle(id,null);const original=x.store.ledger()[0];
+ x.store.patchSettings({dailyLimit:0});
+ x.store.addSource({id:'old-source',kind:'user_fact',text:'我喜欢茶',occasion:'old',createdAt:Date.now(),processed:false,revoked:false});
+ x.store.putJob({id:'old-job',kind:'memory',status:'interrupted',stage:'已中断',reason:'DSH 已关闭或中断',sourceIds:['old-source'],createdAt:Date.now(),updatedAt:Date.now()});
+ x.setAnswer(JSON.stringify({memories:[]}));
+ await x.service.action({action:'job.retry',id:'old-job'});await waitFor(()=>x.store.jobs().some(j=>j.id!=='old-job'&&j.status==='succeeded'));
+ assert.equal(x.calls.length,1);assert.deepEqual(x.store.ledger().find(row=>row.id===id),original);assert.equal(x.store.budgetBlockers().length,0);
+ }finally{await x.close();}});
 test('private chat streams through llm without native session and feed is known with no model call',async()=>{const x=setup();try{
  await x.service.action({action:'interaction',type:'feed',requestId:'feed-1'});assert.equal(x.calls.length,0);assert.equal(x.store.memories().length,0);
  await x.service.action({action:'chat',requestId:'req-1',text:'你知道我刚才做什么了吗？',imageIds:[]});await waitFor(()=>!x.service.snapshot().busy);
  assert.equal(x.calls.length,1);assert.equal(x.calls[0].sessionId,undefined);assert.match(x.calls[0].system,/用户喂食/);assert.equal(x.store.messages().length,2);assert.equal(x.store.messages()[1].status,'complete');
  await x.service.action({action:'chat',requestId:'req-1',text:'重复网络请求',imageIds:[]});assert.equal(x.calls.length,1);
  assert.equal(x.store.sources().length,3);assert.equal(x.store.sources().filter(s=>s.provenance==='behavior').length,1);
+ }finally{await x.close();}});
+test('chat and proactive delivery continue with zero Bilibili cap and an unknown Bilibili charge',async()=>{const x=setup();try{
+ const fee=x.store.reserve('future-bilibili-unknown',.1,true,undefined,'bilibili');x.store.settle(fee,null);x.store.patchSettings({dailyLimit:0});
+ await x.service.action({action:'chat',requestId:'unlimited-chat',text:'你好',imageIds:[]});await waitFor(()=>!x.service.snapshot().busy);
+ assert.equal(x.calls.length,1);assert.equal(x.store.messages().filter(m=>m.role==='assistant')[0].status,'complete');
+ x.store.markProcessed(x.store.sources().map(s=>s.id));
+ const now=Date.now();x.store.addSource({id:'proactive-new',kind:'user_fact',text:'我喜欢从不同角度理解小说人物',occasion:'proactive-new',createdAt:now-61000,processed:false,revoked:false});x.store.markProcessed(['proactive-new']);
+ x.service.presence({windowId:'window',seq:1,typing:false,visible:true,lastInputAt:now-4000});x.setAnswer(JSON.stringify({send:true,text:'关于理解人物，我还想到一个角度。'}));
+ await x.service.tick();await x.service.tick();assert.equal(x.calls.length,2);assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,1);
+ assert.equal(x.store.usage(true).uncertain,true);assert.equal(x.store.ledger().find(row=>row.id===fee)?.actual,null);
+ }finally{await x.close();}});
+test('historical unknown cost permits one format retry with verified usage, but failed sources do not loop',async()=>{const x=setup();try{
+ const id=x.store.reserve('legacy-unknown',.2,true);x.store.settle(id,null);x.store.patchSettings({dailyLimit:0});
+ x.store.addSource({id:'format-source',kind:'user_fact',text:'我喜欢茶',occasion:'format-source',createdAt:Date.now(),processed:false,revoked:false});x.setAnswer('invalid json');
+ await x.service.tick();assert.equal(x.calls.length,2);assert.equal(x.store.jobs().filter(j=>j.kind==='memory')[0].status,'failed');
+ await x.service.tick();await x.service.tick();assert.equal(x.calls.length,2);
+ assert.equal(x.store.ledger().find(row=>row.id===id)?.actual,null);
  }finally{await x.close();}});
 test('truncated replies do not become learning evidence; retry keeps original user message and bills separate attempt',async()=>{const x=setup();try{
  x.setReason('max-tokens');await x.service.action({action:'chat',requestId:'r',text:'你好',imageIds:[]});await waitFor(()=>!x.service.snapshot().busy);
@@ -62,9 +118,11 @@ test('failed memory task does not block a later source or invent unsupported fac
  x.store.addSource({...first,id:'second',text:'我喜欢下雨天',occasion:'two'});x.setAnswer(JSON.stringify({memories:[{kind:'user_fact',text:'用户喜欢下雨天',sourceIds:['second'],quote:'喜欢下雨天'},{kind:'user_fact',text:'用户住在火星',sourceIds:['nonexistent'],quote:'火星'}]}));
  await x.service.tick();assert.equal(x.calls.length,1);assert.equal(x.store.memories().length,1);assert.equal(x.store.memories()[0].text,'用户喜欢下雨天');
  }finally{await x.close();}});
-test('background missing usage pauses and does not turn a failed response into successful memory',async()=>{const x=setup();try{
+test('missing usage prevents automatic retry but does not block another memory task',async()=>{const x=setup();try{
  x.withoutUsage();x.setReason('max-tokens');x.store.addSource({id:'first',kind:'user_fact',text:'我喜欢茶',occasion:'one',createdAt:Date.now(),processed:false,revoked:false});
  await x.service.tick();assert.equal(x.store.usage().uncertain,true);assert.equal(x.calls.length,1);assert.equal(x.store.memories().length,0);assert.equal(x.store.jobs()[0].status,'failed');
+ x.setReason('stop');x.setAnswer(JSON.stringify({memories:[]}));x.store.addSource({id:'second',kind:'user_fact',text:'我喜欢雨天',occasion:'two',createdAt:Date.now(),processed:false,revoked:false});
+ await x.service.tick();assert.equal(x.calls.length,2);assert.equal(x.store.sources().find(s=>s.id==='second')?.processed,true);
  }finally{await x.close();}});
 
 test('proactive delivery writes only one assistant message per occasion and never invents a user turn',async()=>{const x=setup();try{
