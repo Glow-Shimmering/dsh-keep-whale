@@ -37,13 +37,14 @@ export interface MemoryDetail { memory: Memory; sources: Source[]; relations: Me
 export interface DeletePreview { ids: string[]; memories: Memory[]; sourceIds: string[]; revision: number }
 export interface PersonalityProfile { initial: string[]; tentative: Memory[]; tendencies: Memory[] }
 export interface CostDetails { provider: string; model: string; rawUnit: string; conversionRate: number; priceVerified: boolean; rawReserved?: number; rawActual?: number | null; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
-export interface Job { id: string; kind: 'chat' | 'memory' | 'proactive' | 'embedding'; status: 'running' | 'succeeded' | 'failed' | 'interrupted' | 'skipped'; stage: string; reason: string; createdAt: number; updatedAt: number; sourceIds: string[] }
+export interface Job { id: string; kind: 'chat' | 'memory' | 'proactive' | 'embedding' | 'bilibili'; status: 'running' | 'succeeded' | 'failed' | 'interrupted' | 'skipped'; stage: string; reason: string; createdAt: number; updatedAt: number; sourceIds: string[] }
 export interface Ledger { unit?: string; id: string; day: string; jobId: string; background: boolean; reserved: number; actual: number | null; status: 'reserved' | 'settled' | 'uncertain'; createdAt: number; details?: CostDetails; budgetAcknowledgedAt?: number; budgetScope?: 'bilibili' }
 export interface Usage { day: string; spent: number; reserved: number; estimated?: number; uncertain: boolean; chatSpent: number; chatUncertain?: boolean; limit: number; unit: string }
 export interface Interaction { id: string; type: 'pet' | 'feed'; text: string; createdAt: number }
 export interface ModelInfo extends Route { name: string; vision: boolean }
 export interface Presence { windowId: string; visible: boolean; typing: boolean; lastInputAt: number; panelOpen: boolean; at: number }
 export interface Snapshot {
+  bili?: import('./bili/types.js').BiliState;
   token?: string; ledger?: Ledger[]; companion: Companion; settings: Settings; messages: Message[]; memories: Memory[]; sources: Source[];
   interactions: Interaction[]; jobs: Job[]; usage: Usage; models: ModelInfo[]; busy: boolean; unread: number;
   error: string | null; capability: { chat: boolean; images: boolean }; revision: number;

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { HostContext, ModelInfo, Route } from './types.js';
 import type { Store } from './core/store.js';
+import { resolvedImagePricing } from './bili/image-pricing.js';
 
 export class ModelFailure extends Error {
   constructor(public code: string, message: string) { super(message); this.name = 'ModelFailure'; }
@@ -16,7 +17,7 @@ export function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<
     promise.then(value=>{cleanup();resolve(value);},error=>{cleanup();reject(error);});
   });
 }
-export interface CallInput { system: string; messages: any[]; maxTokens: number; signal: AbortSignal; jobId: string; background: boolean; onText?: (text: string)=>void }
+export interface CallInput { system: string; messages: any[]; maxTokens: number; signal: AbortSignal; jobId: string; background: boolean; budgetScope?: 'bilibili'; onText?: (text: string)=>void }
 export class Model {
   constructor(private ctx: HostContext, private store: Store) {}
   available() { return !!this.ctx.get('llm'); }
@@ -38,7 +39,7 @@ export class Model {
     const textBound = Buffer.byteLength(input.system + JSON.stringify(input.messages.map(m=>({...m,content:m.content.filter((c:any)=>c.type!=='image')})))) + 4096;
     let imageBound = 0;
     if (images.length) {
-      const price = llm.imageRequestPricing?.(route.provider, route.model);
+      const price = input.budgetScope==='bilibili' ? resolvedImagePricing(llm,route) : llm.imageRequestPricing?.(route.provider, route.model);
       const estimates = price?.priceImages(images);
       if (estimates?.length === images.length && estimates.every((p:any)=>Number.isFinite(p.visualTokens)&&p.visualTokens>=0)) imageBound = estimates.reduce((n:number,p:any)=>n+p.visualTokens+Buffer.byteLength(p.text||''),0);
       else if (input.background) throw new ModelFailure('VISION_COST', '无法核算图像用量，已暂停后台任务');
@@ -50,7 +51,7 @@ export class Model {
     if (input.background && !priced) throw new ModelFailure('PRICE', '当前模型缺少已确认的计费信息，后台任务已暂停');
     const reserveAmount = priced ? (bound*Math.max(prices.input,prices.cached)+input.maxTokens*prices.output)/1e6 : 0;
     let ticket: string;
-    try { ticket = this.store.reserve(input.jobId,reserveAmount,input.background,priced?{provider:route.provider,model:route.model,rawUnit:this.store.settings().unit,conversionRate:1,priceVerified:true,rawReserved:reserveAmount}:undefined); } catch (e) { throw new ModelFailure('BUDGET', e instanceof Error ? e.message : '后台预算暂不可用'); }
+    try { ticket = this.store.reserve(input.jobId,reserveAmount,input.background,priced?{provider:route.provider,model:route.model,rawUnit:this.store.settings().unit,conversionRate:1,priceVerified:true,rawReserved:reserveAmount}:undefined,input.budgetScope); } catch (e) { throw new ModelFailure('BUDGET', e instanceof Error ? e.message : '后台预算暂不可用'); }
     let text='', usage:any, finish:any, closed=false, dispatched=false, caught:unknown;
     try {
       input.signal.throwIfAborted();

@@ -293,3 +293,25 @@ test('findRequest resolves idempotency directly across full history', () => {
     assert.equal(e.store.putMessage(msg('another-user', 'stable-request', 'user', e.clock())), false);
   } finally { e.cleanup(); }
 });
+
+test('budget acknowledgment rejects an uncertain nested call while its enclosing Bilibili job runs',()=>{
+ const e=setup();try{
+  priced(e.store);const now=e.clock();
+  e.store.putJob({id:'bili:job1',kind:'bilibili',status:'running',stage:'正在了解',reason:'',sourceIds:[],createdAt:now,updatedAt:now});
+  const ticket=e.store.reserve('bili:job1:segment:0:attempt:0',.2,true,undefined,'bilibili');e.store.settle(ticket,null);
+  const row=e.store.budgetBlockers()[0];assert.throws(()=>e.store.acknowledgeBudget(row.id,row.day,row.unit!,row.reserved),/任务仍在运行/);
+  assert.equal(e.store.budgetBlockers().length,1);assert.equal(e.store.usage(true).uncertain,true);
+  e.store.updateJob('bili:job1',{status:'failed',stage:'未完成'});
+  assert.doesNotThrow(()=>e.store.acknowledgeBudget(row.id,row.day,row.unit!,row.reserved));
+  assert.equal(e.store.budgetBlockers().length,0);assert.equal(e.store.ledger().find(l=>l.id===ticket)?.actual,null);
+ }finally{e.cleanup();}
+});
+
+test('unrelated running job whose prefix happens to match does not block acknowledgment',()=>{
+ const e=setup();try{
+  priced(e.store);const now=e.clock();
+  e.store.putJob({id:'bili:job1',kind:'bilibili',status:'running',stage:'正在了解',reason:'',sourceIds:[],createdAt:now,updatedAt:now});
+  const ticket=e.store.reserve('bili:job10:segment:0',.2,true,undefined,'bilibili');e.store.settle(ticket,null);
+  const row=e.store.budgetBlockers()[0];assert.doesNotThrow(()=>e.store.acknowledgeBudget(row.id,row.day,row.unit!,row.reserved));
+ }finally{e.cleanup();}
+});

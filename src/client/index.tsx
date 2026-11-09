@@ -1,7 +1,9 @@
 import type { DeletePreview, EmbeddingSettings, EmbeddingStatus, ImageRef, Ledger, Memory, MemoryDetail, MemoryPage as MemoryPageResult, Message, ModelInfo, PersonalityProfile, Settings, Snapshot } from '../types.js';
 import css from './style.css';
 import chatCss from './chat.css';
+import biliCss from './bili.css';
 import { createMessageText } from './markdown.js';
+import { createBiliPage } from './bili.js';
 import { budgetConfirmation, jobLedgerEntries, manualEmbeddingCalls, manualEmbeddingLabel, summarizeJobCosts } from './cost.js';
 import { moodPortrait, interactionPortrait, interactionDuration, overlaySize as sizeForViewport, clampOverlay, toggleOverlayPosition } from './appearance.js';
 
@@ -15,6 +17,7 @@ window.__ModuleLoader__.load({
     const React = require('react') as typeof import('react');
     const { useState, useEffect, useLayoutEffect, useRef, useCallback } = React;
     const MessageText=createMessageText(React);
+    const BiliPage=createBiliPage(React);
     const PANEL = 'dsh-keep-whale';
     const PREFIX = '/keep-whale';
     const KEY_POSITION = 'dsh-keep-whale:position';
@@ -27,6 +30,7 @@ window.__ModuleLoader__.load({
     const date = (n: number) => Number.isFinite(n) ? new Date(n).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
     const routeKey = (v: {provider:string;model:string} | null) => v ? JSON.stringify([v.provider, v.model]) : '';
     const labels: Record<string, string> = { user_fact:'用户事实', shared_episode:'共同经历', observed_dialogue:'普通对话观察', understanding:'暂定理解', tendency:'逐渐形成的倾向', embedding:'语义索引', active:'生效中', uncertain:'待确认', dormant:'暂未唤起', superseded:'已更新', related:'关联', same_event:'同一事件', supports:'支持', contradicts:'相反证据', updates:'更新', derived_from:'来源', interaction:'互动', chat:'聊天', memory:'记忆整理', proactive:'主动联系', running:'进行中', succeeded:'完成', failed:'未完成', interrupted:'已中断', skipped:'已跳过' };
+    labels.bilibili='逛 B 站';
     const label = (value: string) => labels[value] || value;
 
     let snapshot: Snapshot | null = null;
@@ -70,10 +74,14 @@ window.__ModuleLoader__.load({
     async function send(path: string, body: object): Promise<any> {
       if (!token) await refresh();
       if (!token) throw new Error('暂时无法连接，请确认插件已启动。');
+      // A separate browser may need time to start; login itself never waits for
+      // the user to scan a QR code or enter credentials.
+      const action=path==='action'?(body as {action?:string}).action:undefined;
+      const timeout=path==='upload'?45000:action?.startsWith('bili.')?60000:12000;
       const r = await fetch(`${PREFIX}/${path}`, {
         method:'POST', credentials:'same-origin', cache:'no-store',
         headers:{'content-type':'application/json','x-keep-whale-token':token},
-        body:JSON.stringify(body), signal:AbortSignal.timeout(path === 'upload' ? 45000 : 12000),
+        body:JSON.stringify(body), signal:AbortSignal.timeout(timeout),
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || '操作暂未完成');
@@ -103,7 +111,7 @@ window.__ModuleLoader__.load({
       useEffect(() => acquire(() => redraw(n => n + 1)), []);
       return {data:snapshot, connectionError};
     }
-    type Tab = 'chat' | 'memory' | 'activity' | 'settings';
+    type Tab = 'chat' | 'memory' | 'activity' | 'settings' | 'bili';
     function selectPanel(ctx:any,id:string|null) {
       if(typeof ctx.layout?.selectPanel!=='function')throw new Error('伙伴面板暂时无法打开，请重新加载插件。');
       ctx.layout.selectPanel(id);
@@ -439,7 +447,7 @@ window.__ModuleLoader__.load({
       const handleSave=async(e:React.FormEvent)=>{
         e.preventDefault(); if(saving)return;
         const number=(s:string)=>Number(s);
-        const daily=number(limit); if(!unit.trim() || !Number.isFinite(daily) || daily<=0){report('请填写大于零的 B 站预留预算和费用单位。');return;}
+        const daily=number(limit); if(!unit.trim() || !Number.isFinite(daily) || daily<=0){report('请填写大于零的 B 站预算和费用单位。');return;}
         const specified=[rateInput,rateCached,rateOutput].map(s=>s.trim());
         const hasAny=specified.some(Boolean);
         if(hasAny && (!specified.every(Boolean) || specified.some(s=>!Number.isFinite(number(s))||number(s)<0))){report('计费单价需要同时填写输入、缓存和输出三个非负数字。');return;}
@@ -459,8 +467,8 @@ window.__ModuleLoader__.load({
       return <form className="kw-form" onSubmit={e=>void handleSave(e)}>
         <div className="kw-heading"><div><h2>设置</h2><small>你设置使用边界；伙伴的回应和选择不由滑块控制。</small></div><button className="kw-primary" type="submit" disabled={saving}>{saving?'正在保存…':'保存设置'}</button></div>
         <section className="kw-card kw-stack"><h3>伙伴与形象</h3><label>伙伴名字<input value={name} maxLength={32} onChange={e=>setName(e.target.value)} placeholder="给伙伴起个名字"/></label><small>改名不会改变伙伴 ID 或清空记忆。</small><div className="kw-row"><img src={data.settings.skin || `${PREFIX}/portrait.png`} alt="当前伙伴形象" width="100" height="100" style={{objectFit:'contain'}}/><label className="kw-file">{skinUploading?'正在导入…':'导入本地皮肤'}<input type="file" accept="image/png,image/jpeg,image/webp" disabled={skinUploading} onChange={e=>{void skinChange(e.target.files?.[0]);e.target.value='';}}/></label><button type="button" onClick={()=>void act('skin.reset').then(()=>notice('已恢复默认形象。')).catch(e=>report(formatError(e)))}>恢复默认</button></div><small>图片保存在本机，不会上传到公开仓库。支持 PNG、JPEG、WebP。</small><small role="status">{data.appearance?.available?'当前形象已关联表情与动作素材。':'当前形象未关联表情与动作素材。'}</small>{data.appearance?.available&&<AppearancePreview data={data}/>}</section>
-        <section className="kw-card kw-stack"><h3>模型与预算</h3><label>聊天及后台使用的模型<select value={model} onChange={e=>{setModel(e.target.value);if(e.target.value!==routeKey(initial.priceRoute)){setRateInput('');setRateCached('');setRateOutput('');}}}><option value="">请选择已有模型</option>{modelList.map((m:ModelInfo)=><option key={routeKey(m)} value={routeKey(m)}>{m.name}{m.vision?' · 支持图片':''}</option>)}</select></label><div className="kw-row"><button type="button" onClick={()=>void act('models.refresh').then(()=>notice('模型列表已刷新。')).catch(e=>report(formatError(e)))}>刷新模型列表</button></div><small>图片能力：{chosen?.vision?'已声明支持':'未确认'}。聊天、记忆整理、自动索引和主动联系只记录费用，不设预算上限。下方预算仅为刷 B 站保留；当前版本尚未实现 B 站功能，设置尚不约束任何现有调用。</small>
-          <div className="kw-form-grid"><label>费用单位<input value={unit} onChange={e=>setUnit(e.target.value)} maxLength={16}/></label><label>刷 B 站每日预算（预留）<input type="number" min="0.000001" step="any" value={limit} onChange={e=>setLimit(e.target.value)}/></label><label>每元对应积分（可选）<input type="number" min="0.000001" step="any" value={ratio} onChange={e=>setRatio(e.target.value)} placeholder="例如 30"/></label></div>
+        <section className="kw-card kw-stack"><h3>模型与预算</h3><label>聊天及后台使用的模型<select value={model} onChange={e=>{setModel(e.target.value);if(e.target.value!==routeKey(initial.priceRoute)){setRateInput('');setRateCached('');setRateOutput('');}}}><option value="">请选择已有模型</option>{modelList.map((m:ModelInfo)=><option key={routeKey(m)} value={routeKey(m)}>{m.name}{m.vision?' · 支持图片':''}</option>)}</select></label><div className="kw-row"><button type="button" onClick={()=>void act('models.refresh').then(()=>notice('模型列表已刷新。')).catch(e=>report(formatError(e)))}>刷新模型列表</button></div><small>图片能力：{chosen?.vision?'已声明支持':'未确认'}。聊天、记忆整理、自动索引和主动联系只记录费用，不设预算上限。下方预算约束 B 站功能的模型调用。</small>
+          <div className="kw-form-grid"><label>费用单位<input value={unit} onChange={e=>setUnit(e.target.value)} maxLength={16}/></label><label>刷 B 站每日预算<input type="number" min="0.000001" step="any" value={limit} onChange={e=>setLimit(e.target.value)}/></label><label>每元对应积分（可选）<input type="number" min="0.000001" step="any" value={ratio} onChange={e=>setRatio(e.target.value)} placeholder="例如 30"/></label></div>
           <strong>所选线路单价（每百万 tokens）</strong><div className="kw-form-grid"><label>输入<input type="number" min="0" step="any" value={rateInput} onChange={e=>setRateInput(e.target.value)} placeholder="未设置"/></label><label>缓存命中<input type="number" min="0" step="any" value={rateCached} onChange={e=>setRateCached(e.target.value)} placeholder="未设置"/></label><label>输出<input type="number" min="0" step="any" value={rateOutput} onChange={e=>setRateOutput(e.target.value)} placeholder="未设置"/></label></div><small>单价必须与你选择的模型线路匹配。后台调用仍需配置可靠单价；缺失用量会如实记录，但不阻止后续普通任务。</small>
         </section>
         <EmbeddingPanel data={data} report={report} notice={notice}/>
@@ -487,12 +495,12 @@ window.__ModuleLoader__.load({
       },[]);
       useEffect(()=>{setError('');setNotice('');},[tab]);
       const chooseTab=(value:Tab)=>{nextTab=value;setTab(value);};
-      const tabs:Array<[Tab,string]>=[['chat','对话'],['memory','记忆'],['activity','近况'],['settings','设置']];
-      return <div className="kw-root kw-main"><style>{css+chatCss}</style><div className="kw-shell">
+      const tabs:Array<[Tab,string]>=[['chat','对话'],['memory','记忆'],['activity','近况'],['bili','逛 B 站'],['settings','设置']];
+      return <div className="kw-root kw-main"><style>{css+chatCss+biliCss}</style><div className="kw-shell">
         <header className="kw-header"><div className="kw-title"><img key={moodPortrait(data?.companion.mood,data?.settings.skin,data?.appearance)} src={moodPortrait(data?.companion.mood,data?.settings.skin,data?.appearance)} onError={e=>fallbackPortrait(e,data?.settings.skin)} alt=""/><h1>{data?.companion.name || '陪伴伙伴'}</h1>{data&&<span className="kw-title-mood"><span className="kw-dot"/>{data.settings.quiet?'安静陪伴':data.companion.mood}</span>}</div><button className="kw-back" type="button" onClick={()=>{try{selectPanel(ctx,null);}catch(e){setError(formatError(e));}}}><ChatIcon name="back"/>返回 DSH</button></header>
         <nav className="kw-tabs" role="tablist" aria-label="伙伴面板">{tabs.map(([id,title])=><button key={id} type="button" role="tab" aria-selected={tab===id} onClick={()=>chooseTab(id)}>{title}{id==='chat'&&!!data?.unread?` · ${data.unread}`:''}</button>)}</nav>
         <div className="kw-page-notices">{offline && <p className="kw-error" role="status">{offline} {data && '下方是上次成功连接时的信息。'}</p>}{(error||data?.error) && <p className="kw-error" role="alert">{error||data?.error}</p>}{notice && <p className="kw-notice" role="status">{notice}</p>}</div>
-        {data ? <><Chat data={data} report={setError} active={tab==='chat'} openSettings={()=>chooseTab('settings')}/>{tab!=='chat'&&<div className="kw-page-body">{tab==='memory'?<MemoryPage data={data} report={setError} notice={setNotice}/>:tab==='activity'?<Activity data={data} report={setError}/>:<SettingsPage data={data} report={setError} notice={setNotice}/>}</div>}</> : <div className="kw-page-body"><div className="kw-empty">正在连接伙伴服务…</div></div>}
+        {data ? <><Chat data={data} report={setError} active={tab==='chat'} openSettings={()=>chooseTab('settings')}/>{tab!=='chat'&&<div className="kw-page-body">{tab==='memory'?<MemoryPage data={data} report={setError} notice={setNotice}/>:tab==='activity'?<Activity data={data} report={setError}/>:tab==='bili'?<BiliPage data={data.bili} companionName={data.companion.name} quiet={data.settings.quiet} onAction={act} onChat={()=>chooseTab('chat')} onSettings={()=>chooseTab('settings')} report={setError} notice={setNotice}/>:<SettingsPage data={data} report={setError} notice={setNotice}/>}</div>}</> : <div className="kw-page-body"><div className="kw-empty">正在连接伙伴服务…</div></div>}
       </div></div>;
     }
 
@@ -579,12 +587,12 @@ window.__ModuleLoader__.load({
               <svg className="kw-snack" viewBox="0 0 48 48"><circle cx="24" cy="24" r="19" fill="#eec18a" stroke="#966b43" strokeWidth="2.5"/><path d="M14 16h3m11-4h3m2 18h3m-20 3h3m5-12h3" stroke="#916243" strokeWidth="4" strokeLinecap="round"/><circle cx="31" cy="23" r="2" fill="#fff1d4"/></svg>
             </span>}
           </span>
-          {!collapsed&&<span className="kw-pet-caption"><span className="kw-dot"/>{name} · {state}</span>}
+          {!collapsed&&<span className="kw-pet-caption"><span className="kw-dot"/>{name} · {state}{data?.bili?.busy?' · 正在逛 B 站':''}</span>}
           {collapsed&&offline&&<span className="kw-thumb-offline" aria-hidden="true"/>}
           {collapsed&&!!data?.unread&&<span className="kw-thumb-unread" aria-hidden="true">{data.unread>99?'99+':data.unread}</span>}
         </button>
         {!collapsed&&<button className="kw-collapse" type="button" title="收起" aria-label="收起伙伴" onClick={toggle}>−</button>}
-        {menu&&!collapsed&&<div className="kw-overlay-menu" style={menuStyle} aria-label="伙伴互动"><strong>{data?.companion.name||'伙伴'}</strong><div className="kw-row"><button type="button" disabled={!data||!!offline||interacting||!!anim} onClick={()=>void interact('pet')}>摸摸</button><button type="button" disabled={!data||!!offline||interacting||!!anim} onClick={()=>void interact('feed')}>喂食</button><button type="button" onClick={()=>{showPanel('chat');}}>聊聊</button><button type="button" disabled={!data||!!offline} onClick={()=>{if(data)void act('settings',{patch:{quiet:!data.settings.quiet}}).then(()=>setBubble(data.settings.quiet?'已恢复主动联系。':'已开启安静陪伴。')).catch(e=>setBubble(formatError(e)));}}>{data?.settings.quiet?'恢复关心':'安静陪我'}</button><button type="button" onClick={()=>{showPanel('settings');}}>设置</button><button type="button" onClick={()=>{const p=defaultPosition();setPos(p);write(KEY_POSITION,p);}}>重置位置</button></div></div>}
+        {menu&&!collapsed&&<div className="kw-overlay-menu" style={menuStyle} aria-label="伙伴互动"><strong>{data?.companion.name||'伙伴'}</strong><div className="kw-row"><button type="button" disabled={!data||!!offline||interacting||!!anim} onClick={()=>void interact('pet')}>摸摸</button><button type="button" disabled={!data||!!offline||interacting||!!anim} onClick={()=>void interact('feed')}>喂食</button><button type="button" onClick={()=>{showPanel('chat');}}>聊聊</button><button type="button" onClick={()=>{showPanel('bili');}}>逛 B 站</button><button type="button" disabled={!data||!!offline} onClick={()=>{if(data)void act('settings',{patch:{quiet:!data.settings.quiet}}).then(()=>setBubble(data.settings.quiet?'已恢复主动联系。':'已开启安静陪伴。')).catch(e=>setBubble(formatError(e)));}}>{data?.settings.quiet?'恢复关心':'安静陪我'}</button><button type="button" onClick={()=>{showPanel('settings');}}>设置</button><button type="button" onClick={()=>{const p=defaultPosition();setPos(p);write(KEY_POSITION,p);}}>重置位置</button></div></div>}
         {bubble&&<div className="kw-bubble" role="status" aria-live="polite" style={menuStyle}><span>{bubble}</span>{data?.unread? <button type="button" onClick={()=>{showPanel('chat');}}>聊聊</button>:null}<button type="button" aria-label="关闭提示" onClick={()=>setBubble('')}>×</button></div>}
       </div>;
     }

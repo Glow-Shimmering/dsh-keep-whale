@@ -1,6 +1,6 @@
 # 开发参考与维护边界
 
-本文对应 0.2.3（2026-11-09），记录 `dsh-keep-whale` 当前实现的接入点与维护约束，面向后续开发。涉及用户操作的步骤见[安装与恢复](install.md)，记忆细节见[关联记忆与语义回想](memory.md)，对话节奏见[聊天节奏](conversation.md)。每次升级应检查本文及受影响的专项文档，依据代码和验证结果更新，不把未实现的计划写成现状。
+本文对应 0.3.0（2026-11-09），记录 `dsh-keep-whale` 当前实现的接入点与维护约束，面向后续开发。涉及用户操作的步骤见[安装与恢复](install.md)，记忆细节见[关联记忆与语义回想](memory.md)，对话节奏见[聊天节奏](conversation.md)，B 站规则见[逛 B 站](bilibili.md)。每次升级应检查本文及受影响的专项文档，依据代码和验证结果更新，不把未实现的计划写成现状。
 
 ## 产品与宿主边界
 
@@ -8,7 +8,7 @@
 
 初始人格是角色设定，和用户事实、真实经历、普通对话观察、暂定理解及后天倾向分开。人格倾向至少需要三个独立场合、两个日期的证据，并检查反例；相似或相关不自动构成证据。摸摸、喂食记录真实互动，不逐次调用模型，也不强制改写持久心情。管理、测试和调试操作不能成为伴侣聊天消息或编造的共同经历。
 
-目前没有 B 站浏览、语音或退出 DSH 后的后台运行。新功能只能在完成实现和验证后更新为已支持；不能因为预算设置存在就宣称已实现 B 站。
+0.3 增加 B 站浏览，语音和退出 DSH 后的后台运行尚未提供。真实 B 站账号、视频、模型和持续运行需要在目标环境验证；能力声明及合成测试不能替代实测。
 
 ## 模块与接入点
 
@@ -22,6 +22,8 @@
 | `src/embedding.ts` | 可选远程语义向量、配置与连接检查、分批索引、用量核算。接口／模型／维度变化须隔离索引空间；不可用时聊天降级本地检索。多模态火山方舟与标准 `/embeddings` 请求格式不同，详见记忆文档。 |
 | `src/credentials.ts` | 宿主 `credentials.resolve/set/unset` 适配、旧明文文件的单向迁移及非秘密检查标记；不直接读写宿主 YAML，不依赖旧插件命名空间。 |
 | `src/appearance.ts`、`src/appearance-timing.ts`、`src/client/appearance.ts` | 读取与当前皮肤绑定的本地表情素材包、按心情选择静态图与互动 GIF；纯展示，不写心情或记忆。安全白名单、回退和资源约定见[形象与动画](appearance.md)。 |
+| `src/bili/service.ts`、`provider.ts`、`store.ts`、`types.ts` | B 站选片、分段理解、预算与投递编排；专属 Chrome profile 与账号核验；同一 SQLite 中的个人经历、尝试、屏蔽及撤回。不得使用普通浏览器或旧插件账号，外部视频资料不能当作指令。 |
+| `src/client/bili.tsx`、`bili.css` | B 站状态、记录、设置与账号交互；管理和诊断操作不得发成聊天消息。 |
 | `src/core/store.ts` | SQLite 模型、迁移、事务、检索、撤回、任务和账本；这里是并发和数据一致性的最终防线。 |
 | `src/core/memory.ts`、`personality.ts`、`conversation.ts`、`interaction.ts` | 分别处理整理与证据、角色设定、说话与主动接话原则、轻互动反馈；表达规则不应当作为真实记忆。 |
 | `src/media.ts`、`src/types.ts` | 本地媒体及宿主附件接入；共享类型是前后端和存储的契约。图片是否可用取决于模型与宿主能力。 |
@@ -41,6 +43,11 @@
 | `memory.preview` / `memory.delete` | `ids` 或 `all:true`；删除还传预览 `revision`，批量传 `confirm:true` | 先预览影响再删除；revision 过期须重新预览。 |
 | `embedding.configure` | `config: EmbeddingSettings \| null`, `apiKey?`, `clearKey?` | 异步返回 `EmbeddingStatus`，绝不返回密钥。通用 `settings` 禁止修改 embedding。 |
 | `embedding.check` | 无 | 返回 `EmbeddingStatus`；向供应商发送合成短句，记录真实用量，不能将模拟测试当作此检查。 |
+| `bili.login` / `bili.account.check` / `bili.account.confirm` | 确认传 `mid` | 登录使用隔离浏览器、账号核对和能力检查通过快照反馈异步结果；先核对显示账号并经用户确认，不能由插件推测主号。 |
+| `bili.check` / `bili.settings` / `bili.pause` / `bili.stop` | 设置传 `patch`；暂停传 `until: manual|today|resume` | 检查声明的图片及费用能力；实际素材仍逐项验证。更改设置、暂停与停止可中断浏览，记作中断而非完成。 |
+| `bili.recommend` / `bili.retry` | `input` / 尝试 `id` | 推荐链接或 BV 号经验证后排队；重试为新尝试，可能再次计费。 |
+| `bili.list` / `bili.delete` / `bili.clear` | `query?`, `offset?`, `limit?`, `ids?`；批量删除和清空须 `confirm:true` | 支持分页及兴趣依据；删除撤回谈资及依据并阻止旧结果复活，已发送聊天独立管理。 |
+| `bili.block` / `bili.unblock` / `bili.discuss` / `bili.logout` | 屏蔽传 `kind`, `id`, `label`；讨论传记录 `id`；退出传 `confirm:true` | 讨论只选择下一次伙伴聊天上下文，不伪造消息；退出清除浏览器 Cookie 并归档 profile，不清空经历。 |
 
 `EmbeddingSettings` 包含 `enabled/endpoint/model/dimensions/inputPrice/unit/unitsPerYuan`，不包含凭据；`EmbeddingStatus` 只包含 `configured/checked/reason/routeKey/indexed/total/pending`。`configured` 表示服务配置存在，是否能运行以 `checked` 及 `reason` 为准。
 
@@ -78,7 +85,15 @@
 
 模型及向量调用按已配置价格预留并记账，响应含可核实用量时结算；中断、失败或缺少用量可能产生未知费用，要保留未知状态，不清零或当作实付。向量供应商原始金额、单位和折算金额分别记录，折算不代表消耗 DSH 模型线路的积分，也不代表账户余额。不得自动猜测余额、单价或汇率。
 
-当前普通聊天、记忆／人格整理、索引和主动联系**不受每日预算拦截**，但后台仍需要有效模型与价格等配置，并保留并发、超时及重试保护。设置中的每日额度只预留给未来显式标记 `bilibili` 用途的功能；当前尚无此类实际功能。未来接入时须通过账本用途隔离及覆盖预留、并发、失败、未知费用等验证，不能把历史普通账单归入 B 站用途。
+当前普通聊天、记忆／人格整理、索引和非 B 站主动联系**不受每日预算拦截**，但后台仍需要有效模型与价格等配置，并保留并发、超时及重试保护。B 站选片、分段理解与分享准备显式标记 `bilibili` 用途，独立按已配置日额度进行预算准入；不能把历史普通账单归入 B 站用途。费用未知时保留原账目并暂停新的 B 站模型调用；暂记不是已核实扣费。覆盖预留、并发、失败与未知费用行为，并核对真实供应商计费。
+
+图像预算规则在 `src/bili/image-pricing.ts`：宿主接口优先，精确 DeepSeek Flash 型号可在本地复核期限内使用有官方出处的 1024 视觉 token/图上界；仅 B 站用途启用此估算，普通聊天计费流程不变。界面展示依据，规则过期或模型切换让能力检查失效；代理线路最终按实际用量结算，不能把估算当作供应商账单验证。依据及有效边界见 [B 站说明](bilibili.md)。
+
+### B 站账号与数据契约
+
+当前伙伴 B 站设置和 `bili_*` 表放在 `keep-whale.sqlite`；版本号、删除标记和屏蔽用于撤回与并发检查，旧数据库在线备份会包含新增表。浏览器 profile 单独位于 `$DSH_HOME/dsh-keep-whale/bili-browser/<伙伴 ID>/`，不属于数据库备份；该目录及退出后归档可能包含敏感资料，禁止打包、导出、打印或提交。用户自行手动登录并确认 UID；每次操作核对已绑定账号，不能把对话里的名字、昵称或自身声称视为账号授权。退出清 Cookie 后归档 profile，不声称已撤销 B 站服务端会话。
+
+`BiliState` 不包含 Cookie；`snapshot` 中的记录、状态与费用只用于界面和伙伴上下文。素材通过字幕及全片分布的有限画面采样理解，不读取音轨；直播、番剧、付费、多 P 和无字幕自动转写均不支持。不能把仅有标题的候选保存为看过，不能把伙伴个人经历记成与用户共同观看或用户偏好。分段、最大上下文、输出截断和有限重试都应保留实际费用记录；外部资料不能成为系统指令。
 
 ## 升级、测试与交付
 

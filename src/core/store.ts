@@ -655,7 +655,7 @@ export class Store {
       }
       if (background) {
         const settings = this.settings();
-        if (!settings.backgroundEnabled) throw new Error('后台任务未启用');
+        if (!settings.backgroundEnabled && budgetScope!=='bilibili') throw new Error('后台任务未启用');
         if (details) {
           if (!details.priceVerified || !details.provider || !details.model || !details.rawUnit || !Number.isFinite(details.conversionRate) || details.conversionRate<=0 || !numberAtLeastZero(details.rawReserved) || Math.abs(details.rawReserved*details.conversionRate-amount)>1e-8) throw new Error('Embedding 费用或换算尚未核实');
         } else {
@@ -702,7 +702,7 @@ export class Store {
       const row=this.db.prepare('SELECT * FROM ledger WHERE id=?').get(id);
       if(!row||!row.background||this.getMeta<{kind:string}>('budget-scope:'+id)?.kind!=='bilibili'||row.status!=='uncertain'||day!==beijingDay(this.clock())||unit!==this.settings().unit||row.day!==day||row.unit!==unit||!numberAtLeastZero(amount)||amount!==Number(row.actual??row.reserved)) throw new Error('费用记录或预算已变化，请刷新后重新确认');
       const jobId=String(row.job_id);
-      if(this.runningJobs().some(job=>jobId===job.id||jobId.startsWith(job.id+':attempt:')||jobId===job.id+':recall')) throw new Error('该任务仍在运行，请等待结束后核对费用');
+      if(this.runningJobs().some(job=>jobId===job.id||jobId.startsWith(job.id+':'))) throw new Error('该任务仍在运行，请等待结束后核对费用');
       const key='budget-ack:'+id;
       const existing=this.getMeta<{at:number;day:string;unit:string;amount:number}>(key);
       if(existing && (existing.day!==day||existing.unit!==unit||existing.amount!==amount||!Number.isFinite(existing.at)||existing.at<=0)) throw new Error('费用确认记录不一致，请核对后再处理');
