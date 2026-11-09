@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { EmbeddingCredentials, CredentialFailure, type CredentialSecret, type Credentials } from './credentials.js';
 import type { CostDetails, EmbeddingSettings, EmbeddingStatus, Memory } from './types.js';
 import type { Store } from './core/store.js';
 
@@ -34,7 +33,9 @@ export function embeddingRouteKey(config: EmbeddingSettings): string {
   if (request.multimodal) return hash(JSON.stringify([request.url, c.model, c.dimensions, 'ark-multimodal-v1']));
   return hash(JSON.stringify([c.endpoint, c.model, c.dimensions]));
 }
-type Secret = { apiKey: string; checked?: string };
+export function embeddingCredentialReference(config: EmbeddingSettings): string {
+  return 'KEEP_WHALE_EMBEDDING_' + hash(embeddingRequest(validConfig(config)).url).slice(0,24).toUpperCase();
+}
 type VectorStore = Store & {
   pendingVectors(routeKey: string, limit?: number): Memory[];
   saveVector(memoryId: string, version: number, routeKey: string, vector: number[], revision: number): boolean;
@@ -44,15 +45,28 @@ type VectorStore = Store & {
 };
 export class Embeddings {
   private store: VectorStore;
-  private secretPath: string;
-  constructor(store: Store, root: string, private fetchImpl: typeof fetch = fetch) { this.store=store as VectorStore; this.secretPath=join(root,'embedding-secret.json'); }
-  private secret(): Secret | null { try { const data=JSON.parse(readFileSync(this.secretPath,'utf8')); return typeof data.apiKey==='string' && data.apiKey ? data : null; } catch { return null; } }
-  private writeSecret(secret: Secret) {
-    mkdirSync(join(this.secretPath,'..'), {recursive:true,mode:0o700});
-    const path=this.secretPath+'.'+randomUUID()+'.tmp';
-    try { writeFileSync(path, JSON.stringify(secret), {mode:0o600,flag:'wx'}); renameSync(path,this.secretPath); chmodSync(this.secretPath,0o600); }
-    finally { try { unlinkSync(path); } catch {} }
+  private credentials: EmbeddingCredentials;
+  private cachedSecret: CredentialSecret | null = null;
+  private credentialError = '正在读取 DSH 凭据';
+  private operations: Promise<unknown> = Promise.resolve();
+  constructor(store: Store, root: string, private fetchImpl: typeof fetch = fetch, provider: () => Credentials | undefined = () => undefined) {
+    this.store=store as VectorStore; this.credentials=new EmbeddingCredentials(root,provider);
   }
+  private serial<T>(operation: () => Promise<T>): Promise<T> {
+    const result=this.operations.then(operation);
+    this.operations=result.catch(()=>{}); return result;
+  }
+  private async refreshNow(): Promise<void> {
+    try {
+      const c=this.config();
+      this.cachedSecret=c ? await this.credentials.read(embeddingCredentialReference(c),key=>this.fingerprint(c,key)) : null;
+      this.credentialError='';
+    } catch(e) {
+      this.cachedSecret=null;
+      this.credentialError=e instanceof CredentialFailure ? e.message : 'DSH 凭据暂不可用';
+    }
+  }
+  async refresh(): Promise<void> { await this.serial(()=>this.refreshNow()); }
   private fingerprint(c: EmbeddingSettings, key: string) { return hash(JSON.stringify([validConfig(c), key])); }
   private config(): EmbeddingSettings | null { const c=this.store.settings().embedding; return c ? validConfig(c) : null; }
   private rate(c: EmbeddingSettings): number {
@@ -63,26 +77,41 @@ export class Embeddings {
   }
   status(): EmbeddingStatus {
     try {
-      const c=this.config(), key=this.secret();
+      const c=this.config(), key=this.cachedSecret;
       if(!c) return {configured:false,checked:false,reason:'尚未配置语义回想',routeKey:null,indexed:0,total:0,pending:0};
       const routeKey=embeddingRouteKey(c), counts=this.store.vectorCounts(routeKey);
       let checked=c.enabled && !!key && key.checked===this.fingerprint(c,key.apiKey);
-      let reason=!c.enabled?'语义回想已关闭':!key?'需要设置密钥':!checked?'需要检查连接':'';
+      let reason=!c.enabled?'语义回想已关闭':this.credentialError||(!key?'需要设置密钥':!checked?'需要检查连接':'');
       try { this.rate(c); } catch { checked=false; reason='费用单位无法换算'; }
       return {configured:true,checked,reason,routeKey,...counts};
     } catch { return {configured:false,checked:false,reason:'嵌入服务配置无效',routeKey:null,indexed:0,total:0,pending:0}; }
   }
-  configure(config: EmbeddingSettings | null, apiKey?: string, clearKey=false): EmbeddingStatus {
+  async configure(config: EmbeddingSettings | null, apiKey?: string, clearKey=false): Promise<EmbeddingStatus> {
     const c=config ? validConfig(config) : null;
     if(apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.length>8192 || /[\r\n]/.test(apiKey))) throw new Error('密钥格式无效');
-    const previous=this.secret();
-    const old=this.config();
-    const originChanged=!!old && !!c && new URL(old.endpoint).origin!==new URL(c.endpoint).origin;
-    if(clearKey || !c || originChanged && !(apiKey?.trim())) { if(existsSync(this.secretPath)) unlinkSync(this.secretPath); }
-    else if(apiKey !== undefined && apiKey.trim()) this.writeSecret({apiKey:apiKey.trim()});
-    else if(previous && (!c || previous.checked!==this.fingerprint(c,previous.apiKey))) this.writeSecret({apiKey:previous.apiKey});
-    this.store.patchSettings({embedding:c});
-    return this.status();
+    return this.serial(async()=>{
+      await this.refreshNow();
+      const old=this.config(), oldRef=old ? embeddingCredentialReference(old) : null;
+      const reference=c ? embeddingCredentialReference(c) : oldRef;
+      // Explicit replacement/removal also lets the user resolve a migration conflict.
+      const replacement=!!apiKey?.trim();
+      if(this.credentialError && !replacement && !clearKey && c) throw new CredentialFailure(this.credentialError);
+      const previous=this.cachedSecret;
+      this.cachedSecret=null;
+      try {
+        if(reference && (clearKey || !c)) { await this.credentials.clear(reference); this.credentials.discardLegacy(); }
+        else if(reference && replacement) { await this.credentials.save(reference,apiKey!.trim()); this.credentials.discardLegacy(); }
+        else if(old && c && oldRef!==reference && previous && new URL(old.endpoint).origin===new URL(c.endpoint).origin) {
+          const target=await this.credentials.read(reference!,key=>this.fingerprint(c,key));
+          if(!target) await this.credentials.save(reference!,previous.apiKey);
+        }
+        // Keep old endpoint references, as DSH's original plugin does. Settings and
+        // credentials cannot share a transaction; never delete the last usable key
+        // merely because a new endpoint/configuration failed to commit.
+        this.store.patchSettings({embedding:c});
+      } finally { await this.refreshNow(); }
+      return this.status();
+    });
   }
   private async perform(texts: string[], c: EmbeddingSettings, key: string, opts: {signal?:AbortSignal;jobId:string;background:boolean}): Promise<number[][]> {
     opts.signal?.throwIfAborted();
@@ -138,35 +167,44 @@ export class Embeddings {
     return vectors;
   }
   async check(signal?:AbortSignal): Promise<EmbeddingStatus> {
-    const c=this.config(), secret=this.secret();
-    if(!c || !secret || !c.enabled) throw new Error('请先启用并配置嵌入服务和密钥');
+    await this.refresh();
+    const c=this.config(), secret=this.cachedSecret;
+    if(!c || !secret || !c.enabled) throw new Error(this.credentialError || '请先启用并配置嵌入服务和密钥');
     const fingerprint=this.fingerprint(c,secret.apiKey);
     await this.perform(['连接检查'],c,secret.apiKey,{signal,jobId:'embedding-check:'+randomUUID(),background:false});
-    const now=this.config(), current=this.secret();
-    if(!now || !current || this.fingerprint(now,current.apiKey)!==fingerprint) throw new Error('配置已变化，请重新检查');
-    this.writeSecret({apiKey:current.apiKey,checked:fingerprint});
-    return this.status();
+    return this.serial(async()=>{
+      await this.refreshNow();
+      const now=this.config(), current=this.cachedSecret;
+      if(!now || !current || this.fingerprint(now,current.apiKey)!==fingerprint) throw new Error('配置已变化，请重新检查');
+      signal?.throwIfAborted();
+      this.credentials.markChecked(embeddingCredentialReference(now),fingerprint);
+      this.cachedSecret={...current,checked:fingerprint};
+      return this.status();
+    });
   }
-  private ready() {
-    const c=this.config(), secret=this.secret();
-    if(!c || !c.enabled || !secret || secret.checked!==this.fingerprint(c,secret.apiKey)) throw new Error('嵌入服务尚未通过连接检查');
+  private async ready() {
+    await this.refresh();
+    const c=this.config(), secret=this.cachedSecret;
+    if(!c || !c.enabled || !secret || secret.checked!==this.fingerprint(c,secret.apiKey)) throw new Error(this.credentialError || '嵌入服务尚未通过连接检查');
     this.rate(c); return {c,key:secret.apiKey,routeKey:embeddingRouteKey(c)};
   }
   async query(text:string, opts:{signal?:AbortSignal;jobId:string;background:boolean}):Promise<{vector:number[];routeKey:string}> {
     if(!text.trim()||text.length>20000) throw new Error('语义查询内容无效');
-    const {c,key,routeKey}=this.ready();
+    const {c,key,routeKey}=await this.ready();
     const [vector]=await this.perform([text],c,key,opts);
-    if(this.status().routeKey!==routeKey || !this.status().checked) throw new Error('嵌入配置已变化');
+    await this.refresh();
+    if(this.status().routeKey!==routeKey || !this.status().checked || this.cachedSecret?.apiKey!==key) throw new Error('嵌入配置已变化');
     return {vector,routeKey};
   }
   async indexBatch(opts:{signal?:AbortSignal;jobId:string;rows?:Memory[]}):Promise<number> {
-    const {c,key,routeKey}=this.ready(), revision=this.store.revision();
+    const {c,key,routeKey}=await this.ready(), revision=this.store.revision();
     const rows=opts.rows ?? this.store.pendingVectors(routeKey,8);
     if(rows.length>8) throw new Error('单次索引最多处理八条记忆');
     if(!rows.length)return 0;
     const vectors=await this.perform(rows.map(row=>row.text),c,key,{...opts,background:true});
     opts.signal?.throwIfAborted();
-    if(this.status().routeKey!==routeKey || !this.status().checked) throw new Error('嵌入配置已变化');
+    await this.refresh();
+    if(this.status().routeKey!==routeKey || !this.status().checked || this.cachedSecret?.apiKey!==key) throw new Error('嵌入配置已变化');
     let saved=0;
     rows.forEach((row,i)=>{if(this.store.saveVector(row.id,row.version??1,routeKey,vectors[i],revision))saved++;});
     return saved;

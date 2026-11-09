@@ -1,6 +1,6 @@
 {
   "name": "dsh-keep-whale",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "在 DeepSeek Harness 中拥有独立聊天、记忆和日常互动的陪伴伙伴。",
   "type": "module",
   "license": "MIT",
@@ -15,6 +15,7 @@
     "public",
     "cordis.patch.yml",
     "README.md",
+    "AGENTS.md",
     "LICENSE",
     "docs",
     "scripts/backup-memory.mjs",

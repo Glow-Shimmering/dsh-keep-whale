@@ -24,13 +24,13 @@
 | --- | --- |
 | 服务地址 | 兼容 `/embeddings` 的 HTTPS 基础地址或完整端点；本机开发可用 localhost HTTP |
 | 模型与维度 | 使用供应商支持的模型及维度；例如 text-embedding-v4 / 1024 |
-| 密钥 | 仅保存在 DSH_HOME 下权限受限的独立文件，不回传页面、导出或日志 |
+| 密钥 | 通过宿主 credentials 服务保存，不回传页面、导出或日志；当前 DSH 提供器仍是权限受限的明文存储 |
 | 输入单价 | 每百万输入 token 的供应商价格，须按实际线路填写 |
 | 费用单位与换算 | 供应商原单位、每元对应多少原单位，用于折算当前预算单位 |
 
 百炼示例：从控制台取得当前业务空间的 OpenAI 兼容基础地址，模型填写 `text-embedding-v4`，维度 `1024`；北京地域当前原价为每百万 token 0.5 元，单位选“元”，每元原单位为 1。地址与价格以[官方兼容接口](https://docs.bailian.console.aliyun.com/zh/model-studio/embedding-interfaces-compatible-with-openai)和[模型价格](https://help.aliyun.com/zh/model-studio/text-embedding-v4)为准，示例不会自动配置或启用。
 
-保存后点击检查连接。检查只发送合成短句并单独计费；通过后自动逐步索引有效记忆。关闭服务、修改模型/维度/密钥或单价后需重新检查。更换服务域名时必须重新提供密钥，防止旧凭据发往另一个供应商。向量按线路、内容版本缓存，不重新嵌入每轮全部历史。
+保存后点击检查连接。检查只发送合成短句并单独计费；通过后自动逐步索引有效记忆。关闭服务、修改模型/维度/密钥或单价后需重新检查。更换服务域名时需提供该接口自己的密钥，防止旧凭据发往另一个供应商。同域路径调整可沿用密钥，但需要重新检查；等价的火山方舟地址共用同一凭据引用。旧接口引用保留在 DSH 中，清除按钮只清除当前接口的引用。向量按线路、内容版本缓存，不重新嵌入每轮全部历史。
 
 火山方舟 `doubao-embedding-vision-*` 使用多模态向量接口，即使这里只索引文字，也不能使用标准文本 `/embeddings` 协议。插件会自动选择多模态请求和响应格式。北京地域地址可填 `https://ark.cn-beijing.volces.com/api/v3` 或完整 `/api/v3/embeddings/multimodal` 端点；仅填写北京服务域名时也会补齐这个路径。使用 `ep-*` 推理接入点 ID 时，请填写完整多模态端点以选择正确协议。`doubao-embedding-vision-251215` 支持 1024 或 2048 维，密钥、模型开通状态与单价请以自己的账户为准。接口依据：[火山官方多模态向量化 API](https://console.volcengine.com/ark/region:cn-beijing/docs/multimodal-vectorization-api)。
 

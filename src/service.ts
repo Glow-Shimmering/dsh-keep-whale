@@ -26,8 +26,8 @@ export class Service {
   private models:Snapshot['models']=[]; private error:string|null=null;
   private observing=new Map<string,Source>(); private startupAt=Date.now();
   private management=new Set<AbortController>();
-  constructor(readonly store:Store,readonly ctx:HostContext,root:string) { this.model=new Model(ctx,store);this.media=new Media(root,ctx);this.embeddings=new Embeddings(store,root); }
-  async start() { await this.refreshModels(); this.timer=setInterval(()=>void this.tick().catch(()=>{this.error='后台任务暂不可用，请查看近况';}),5000);this.timer.unref?.(); }
+  constructor(readonly store:Store,readonly ctx:HostContext,root:string) { this.model=new Model(ctx,store);this.media=new Media(root,ctx);this.embeddings=new Embeddings(store,root,fetch,()=>ctx.get('credentials')); }
+  async start() { await this.embeddings.refresh(); await this.refreshModels(); this.timer=setInterval(()=>void this.tick().catch(()=>{this.error='后台任务暂不可用，请查看近况';}),5000);this.timer.unref?.(); }
   async refreshModels() { try{this.models=await this.model.catalog();}catch{this.models=[];} }
   snapshot():Snapshot {
     const messages=this.store.messages();

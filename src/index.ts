@@ -30,6 +30,11 @@ export async function apply(ctx:HostContext) {
     }
     const service=new Service(store,ctx,root);
     const off=ctx.on('session/event',(session:any,event:any)=>service.observe(session,event));
+    ctx.inject(['credentials'],(credentialContext:any)=>{
+      void service.embeddings.refresh();
+      credentialContext.on('credentials/reference-updated',()=>void service.embeddings.refresh());
+      credentialContext.on('dispose',()=>void service.embeddings.refresh());
+    });
     const offModels=ctx.on('llm/adapters-updated',()=>void service.refreshModels());
     ctx.inject(['webServer'],(web:any)=>web.effect(()=>web.webServer.register({kind:'prefix',path:'/keep-whale',handler:createHandler(service,new URL('../public/whale-girl.png',import.meta.url))})));
     ctx.on('dispose',()=>{off();offModels();void service.dispose().finally(()=>{store.close();release();});});
