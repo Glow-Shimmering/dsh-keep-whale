@@ -3,6 +3,7 @@ import css from './style.css';
 import chatCss from './chat.css';
 import { createMessageText } from './markdown.js';
 import { budgetConfirmation, jobLedgerEntries, manualEmbeddingCalls, manualEmbeddingLabel, summarizeJobCosts } from './cost.js';
+import { moodPortrait, interactionPortrait, overlaySize as sizeForViewport, clampOverlay, toggleOverlayPosition, INTERACTION_MS } from './appearance.js';
 
 declare global {
   interface Window { __ModuleLoader__: { load(options: { id: string; factory: (require: (name: string) => any) => object }): void } }
@@ -145,6 +146,11 @@ window.__ModuleLoader__.load({
       }, []);
     }
     function formatError(e: unknown) { return e instanceof Error ? e.message : '操作暂未完成'; }
+    function fallbackPortrait(event: React.SyntheticEvent<HTMLImageElement>, skin?:string|null) {
+      const image=event.currentTarget;
+      if(!image.dataset.fallback && skin) {image.dataset.fallback='1';image.src=skin;}
+      else if(image.dataset.fallback!=='2'){image.dataset.fallback='2';image.src=`${PREFIX}/portrait.png`;}
+    }
     function downloadJSON(value: unknown) {
       const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], {type:'application/json'}));
       const link = document.createElement('a'); link.href = url; link.download = 'keep-whale-memories.json'; link.click();
@@ -175,7 +181,7 @@ window.__ModuleLoader__.load({
       const latestIds = new Set(data.messages.map(message => message.id));
       const list = [...older.filter(message => !latestIds.has(message.id)), ...data.messages];
       const modelName=data.models.find(m=>routeKey(m)===routeKey(data.settings.model))?.name || data.settings.model?.model || '选择模型';
-      const portrait=data.settings.skin||`${PREFIX}/portrait.png`;
+      const portrait=moodPortrait(data.companion.mood,data.settings.skin,data.appearance);
       useEffect(()=>()=>{if(copyTimer.current)clearTimeout(copyTimer.current);},[]);
       useEffect(() => {
         const previous=previousSnapshot.current;
@@ -250,9 +256,9 @@ window.__ModuleLoader__.load({
               {hasMore&&list.length>0&&<button className="kw-text-button" type="button" disabled={loadingHistory} onClick={()=>void loadHistory()}>{loadingHistory?'正在读取…':'加载更早的聊天'}</button>}
               {!!list.length&&<details className="kw-chat-menu"><summary aria-label="聊天管理" title="聊天管理"><ChatIcon name="more"/></summary><div><button type="button" className="kw-danger" disabled={data.busy} onClick={clearVisible}>删除已加载的聊天</button></div></details>}
             </div>
-            {list.length===0 && <div className="kw-chat-welcome"><img src={portrait} alt=""/><h2>{data.companion.name}在这里</h2><p>今天想聊些什么？</p></div>}
+            {list.length===0 && <div className="kw-chat-welcome"><img key={portrait} src={portrait} onError={e=>fallbackPortrait(e,data.settings.skin)} alt=""/><h2>{data.companion.name}在这里</h2><p>今天想聊些什么？</p></div>}
             {list.map(m => <article key={m.id} className={`kw-chat-message kw-chat-${m.role}`} aria-label={`${m.role==='user'?'你':data.companion.name}的消息`}>
-              {m.role==='assistant'&&<img className="kw-message-avatar" src={portrait} alt={data.companion.name}/>}
+              {m.role==='assistant'&&<img className="kw-message-avatar" key={portrait} src={portrait} onError={e=>fallbackPortrait(e,data.settings.skin)} alt={data.companion.name}/>}
               <div className="kw-message-main">
                 {m.role==='assistant'&&<div className="kw-reply-heading"><strong>{data.companion.name}</strong>{m.origin==='proactive'&&<span>主动分享</span>}{m.status==='streaming'&&<span className="kw-stream-status" role="status">正在回复<span className="kw-typing-dots" aria-hidden="true"><i/><i/><i/></span></span>}</div>}
                 <div className="kw-message-content">{m.text&&<MessageText text={m.text} role={m.role}/>}{!m.text&&m.status==='streaming'&&<span className="kw-thinking">让我想一想…</span>}
@@ -386,6 +392,31 @@ window.__ModuleLoader__.load({
         <div className="kw-row"><button type="button" className="kw-primary" disabled={busy} onClick={()=>void save()}>保存语义配置</button><button type="button" disabled={busy||!status?.configured||!data.settings.embedding?.enabled} onClick={()=>void check()}>执行能力检查</button><button type="button" disabled={busy||!status?.configured} onClick={()=>void remove()}>移除配置与密钥</button></div>
       </section>;
     }
+    function AppearancePreview({data}: {data:Snapshot}) {
+      const [open,setOpen]=useState(false);
+      const [preview,setPreview]=useState<'pet'|'feed'|null>(null);
+      const [playbackId,setPlaybackId]=useState('');
+      const timer=useRef<ReturnType<typeof setTimeout>|null>(null);
+      const {reduced,visible}=useMotionPreferences();
+      const stop=()=>{if(timer.current)clearTimeout(timer.current);timer.current=null;setPreview(null);};
+      useEffect(()=>()=>{if(timer.current)clearTimeout(timer.current);},[]);
+      useEffect(()=>{if(!visible)stop();},[visible]);
+      const play=(type:'pet'|'feed')=>{
+        if(timer.current)clearTimeout(timer.current);
+        setPlaybackId(createId());setPreview(type);
+        timer.current=setTimeout(()=>{timer.current=null;setPreview(null);},INTERACTION_MS[type]);
+      };
+      const moods=['平静','开心','期待','担心','沮丧','不满','害羞','释然'];
+      const src=interactionPortrait(data.companion.mood,data.settings.skin,data.appearance,preview,reduced,visible,playbackId);
+      return <details className="kw-appearance-preview" onToggle={event=>{const next=event.currentTarget.open;setOpen(next);if(!next)stop();}}>
+        <summary>预览表情与动作</summary>
+        {open&&<div className="kw-stack">
+          <small>仅预览画面，不记录互动，也不会改变心情。</small>
+          <div className="kw-mood-grid">{moods.map(mood=><figure key={mood}><img src={moodPortrait(mood,data.settings.skin,data.appearance)} onError={event=>fallbackPortrait(event,data.settings.skin)} alt=""/><figcaption>{mood}</figcaption></figure>)}</div>
+          <div className="kw-preview-action"><img key={src} src={src} onError={event=>fallbackPortrait(event,data.settings.skin)} alt={preview==='pet'?'摸摸动作预览':preview==='feed'?'喂食动作预览':'当前心情预览'}/><div className="kw-row"><button type="button" onClick={()=>play('pet')}>预览摸摸</button><button type="button" onClick={()=>play('feed')}>预览喂食</button></div></div>
+        </div>}
+      </details>;
+    }
     function SettingsPage({data,report,notice}: {data:Snapshot;report:(s:string)=>void;notice:(s:string)=>void}) {
       const initial=data.settings;
       const [name,setName]=useState(data.companion.name);
@@ -427,7 +458,7 @@ window.__ModuleLoader__.load({
       const skinChange=async(file:File|undefined)=>{if(!file)return;setSkinUploading(true);report('');try{const image=await upload(file,'skin');await act('settings',{patch:{skin:image.url}});notice('自定义皮肤已保存到本机。');}catch(e){report(formatError(e));}finally{setSkinUploading(false);}};
       return <form className="kw-form" onSubmit={e=>void handleSave(e)}>
         <div className="kw-heading"><div><h2>设置</h2><small>你设置使用边界；伙伴的回应和选择不由滑块控制。</small></div><button className="kw-primary" type="submit" disabled={saving}>{saving?'正在保存…':'保存设置'}</button></div>
-        <section className="kw-card kw-stack"><h3>伙伴与形象</h3><label>伙伴名字<input value={name} maxLength={32} onChange={e=>setName(e.target.value)} placeholder="给伙伴起个名字"/></label><small>改名不会改变伙伴 ID 或清空记忆。</small><div className="kw-row"><img src={data.settings.skin || `${PREFIX}/portrait.png`} alt="当前伙伴形象" width="100" height="100" style={{objectFit:'contain'}}/><label className="kw-file">{skinUploading?'正在导入…':'导入本地皮肤'}<input type="file" accept="image/png,image/jpeg,image/webp" disabled={skinUploading} onChange={e=>{void skinChange(e.target.files?.[0]);e.target.value='';}}/></label><button type="button" onClick={()=>void act('skin.reset').then(()=>notice('已恢复默认形象。')).catch(e=>report(formatError(e)))}>恢复默认</button></div><small>图片保存在本机，不会上传到公开仓库。支持 PNG、JPEG、WebP。</small></section>
+        <section className="kw-card kw-stack"><h3>伙伴与形象</h3><label>伙伴名字<input value={name} maxLength={32} onChange={e=>setName(e.target.value)} placeholder="给伙伴起个名字"/></label><small>改名不会改变伙伴 ID 或清空记忆。</small><div className="kw-row"><img src={data.settings.skin || `${PREFIX}/portrait.png`} alt="当前伙伴形象" width="100" height="100" style={{objectFit:'contain'}}/><label className="kw-file">{skinUploading?'正在导入…':'导入本地皮肤'}<input type="file" accept="image/png,image/jpeg,image/webp" disabled={skinUploading} onChange={e=>{void skinChange(e.target.files?.[0]);e.target.value='';}}/></label><button type="button" onClick={()=>void act('skin.reset').then(()=>notice('已恢复默认形象。')).catch(e=>report(formatError(e)))}>恢复默认</button></div><small>图片保存在本机，不会上传到公开仓库。支持 PNG、JPEG、WebP。</small><small role="status">{data.appearance?.available?'当前形象已关联表情与动作素材。':'当前形象未关联表情与动作素材。'}</small>{data.appearance?.available&&<AppearancePreview data={data}/>}</section>
         <section className="kw-card kw-stack"><h3>模型与预算</h3><label>聊天及后台使用的模型<select value={model} onChange={e=>{setModel(e.target.value);if(e.target.value!==routeKey(initial.priceRoute)){setRateInput('');setRateCached('');setRateOutput('');}}}><option value="">请选择已有模型</option>{modelList.map((m:ModelInfo)=><option key={routeKey(m)} value={routeKey(m)}>{m.name}{m.vision?' · 支持图片':''}</option>)}</select></label><div className="kw-row"><button type="button" onClick={()=>void act('models.refresh').then(()=>notice('模型列表已刷新。')).catch(e=>report(formatError(e)))}>刷新模型列表</button></div><small>图片能力：{chosen?.vision?'已声明支持':'未确认'}。聊天、记忆整理、自动索引和主动联系只记录费用，不设预算上限。下方预算仅为刷 B 站保留；当前版本尚未实现 B 站功能，设置尚不约束任何现有调用。</small>
           <div className="kw-form-grid"><label>费用单位<input value={unit} onChange={e=>setUnit(e.target.value)} maxLength={16}/></label><label>刷 B 站每日预算（预留）<input type="number" min="0.000001" step="any" value={limit} onChange={e=>setLimit(e.target.value)}/></label><label>每元对应积分（可选）<input type="number" min="0.000001" step="any" value={ratio} onChange={e=>setRatio(e.target.value)} placeholder="例如 30"/></label></div>
           <strong>所选线路单价（每百万 tokens）</strong><div className="kw-form-grid"><label>输入<input type="number" min="0" step="any" value={rateInput} onChange={e=>setRateInput(e.target.value)} placeholder="未设置"/></label><label>缓存命中<input type="number" min="0" step="any" value={rateCached} onChange={e=>setRateCached(e.target.value)} placeholder="未设置"/></label><label>输出<input type="number" min="0" step="any" value={rateOutput} onChange={e=>setRateOutput(e.target.value)} placeholder="未设置"/></label></div><small>单价必须与你选择的模型线路匹配。后台调用仍需配置可靠单价；缺失用量会如实记录，但不阻止后续普通任务。</small>
@@ -458,7 +489,7 @@ window.__ModuleLoader__.load({
       const chooseTab=(value:Tab)=>{nextTab=value;setTab(value);};
       const tabs:Array<[Tab,string]>=[['chat','对话'],['memory','记忆'],['activity','近况'],['settings','设置']];
       return <div className="kw-root kw-main"><style>{css+chatCss}</style><div className="kw-shell">
-        <header className="kw-header"><div className="kw-title"><img src={data?.settings.skin||`${PREFIX}/portrait.png`} alt=""/><h1>{data?.companion.name || '陪伴伙伴'}</h1>{data&&<span className="kw-title-mood"><span className="kw-dot"/>{data.settings.quiet?'安静陪伴':data.companion.mood}</span>}</div><button className="kw-back" type="button" onClick={()=>{try{selectPanel(ctx,null);}catch(e){setError(formatError(e));}}}><ChatIcon name="back"/>返回 DSH</button></header>
+        <header className="kw-header"><div className="kw-title"><img key={moodPortrait(data?.companion.mood,data?.settings.skin,data?.appearance)} src={moodPortrait(data?.companion.mood,data?.settings.skin,data?.appearance)} onError={e=>fallbackPortrait(e,data?.settings.skin)} alt=""/><h1>{data?.companion.name || '陪伴伙伴'}</h1>{data&&<span className="kw-title-mood"><span className="kw-dot"/>{data.settings.quiet?'安静陪伴':data.companion.mood}</span>}</div><button className="kw-back" type="button" onClick={()=>{try{selectPanel(ctx,null);}catch(e){setError(formatError(e));}}}><ChatIcon name="back"/>返回 DSH</button></header>
         <nav className="kw-tabs" role="tablist" aria-label="伙伴面板">{tabs.map(([id,title])=><button key={id} type="button" role="tab" aria-selected={tab===id} onClick={()=>chooseTab(id)}>{title}{id==='chat'&&!!data?.unread?` · ${data.unread}`:''}</button>)}</nav>
         <div className="kw-page-notices">{offline && <p className="kw-error" role="status">{offline} {data && '下方是上次成功连接时的信息。'}</p>}{(error||data?.error) && <p className="kw-error" role="alert">{error||data?.error}</p>}{notice && <p className="kw-notice" role="status">{notice}</p>}</div>
         {data ? <><Chat data={data} report={setError} active={tab==='chat'} openSettings={()=>chooseTab('settings')}/>{tab!=='chat'&&<div className="kw-page-body">{tab==='memory'?<MemoryPage data={data} report={setError} notice={setNotice}/>:tab==='activity'?<Activity data={data} report={setError}/>:<SettingsPage data={data} report={setError} notice={setNotice}/>}</div>}</> : <div className="kw-page-body"><div className="kw-empty">正在连接伙伴服务…</div></div>}
@@ -466,23 +497,36 @@ window.__ModuleLoader__.load({
     }
 
     type Pos = {x:number;y:number};
-    // Keep these dimensions in sync with the 156px frame, 180px portrait and
-    // caption styles. The caption adds about 27px; 210/42 leave a small margin.
-    const overlaySize=(collapsed=false)=>({width:Math.min(156,innerWidth),height:Math.min(collapsed?42:210,innerHeight)});
-    const clamp=(p:Pos,collapsed=false):Pos=>{const size=overlaySize(collapsed);return {x:Math.max(0,Math.min(p.x,Math.max(0,innerWidth-size.width))),y:Math.max(0,Math.min(p.y,Math.max(0,innerHeight-size.height)))};};
+    // The measured frame sizes must track .kw-overlay and .kw-collapsed.
+    const overlaySize=(collapsed=false)=>sizeForViewport(collapsed,innerWidth,innerHeight);
+    const clamp=(p:Pos,collapsed=false):Pos=>clampOverlay(p,collapsed,innerWidth,innerHeight);
     const defaultPosition=(collapsed=false):Pos=>{const size=overlaySize(collapsed);return clamp({x:innerWidth-size.width-18,y:innerHeight-size.height-18},collapsed);};
+    function useMotionPreferences() {
+      const [reduced,setReduced]=useState(()=>typeof window.matchMedia==='function'&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+      const [visible,setVisible]=useState(()=>document.visibilityState==='visible');
+      useEffect(()=>{
+        const media=typeof window.matchMedia==='function'?window.matchMedia('(prefers-reduced-motion: reduce)'):null;
+        const motion=()=>setReduced(!!media?.matches), visibility=()=>setVisible(document.visibilityState==='visible');
+        media?.addEventListener?.('change',motion);document.addEventListener('visibilitychange',visibility);
+        motion();visibility();
+        return()=>{media?.removeEventListener?.('change',motion);document.removeEventListener('visibilitychange',visibility);};
+      },[]);
+      return {reduced,visible};
+    }
     function Overlay({ctx}: {ctx:any}) {
       const {data,connectionError:offline}=useData(); usePresence();
       const [pos,setPos]=useState<Pos>(()=>{const isCollapsed=read(KEY_COLLAPSED,false);return clamp(read(KEY_POSITION,defaultPosition(isCollapsed)),isCollapsed);});
       const [collapsed,setCollapsed]=useState(()=>read(KEY_COLLAPSED,false));
       const [menu,setMenu]=useState(false), [bubble,setBubble]=useState('');
       const [anim,setAnim]=useState<'pet'|'feed'|null>(null), [interacting,setInteracting]=useState(false);
+      const [playbackId,setPlaybackId]=useState('');const {reduced,visible}=useMotionPreferences();
       const actionPending=useRef(false), animationTimer=useRef<ReturnType<typeof setTimeout>|null>(null), mounted=useRef(true);
       const drag=useRef<{x:number;y:number;origin:Pos;moved:boolean;pointerId:number}|null>(null);
       const suppressClick=useRef(false), previousUnread=useRef<number|null>(null), dismiss=useRef<ReturnType<typeof setTimeout>|null>(null);
       const positionRef=useRef(pos); positionRef.current=pos;
       useEffect(()=>{const resize=()=>setPos(p=>{const adjusted=clamp(p,collapsed);write(KEY_POSITION,adjusted);return adjusted;});window.addEventListener('resize',resize);return()=>window.removeEventListener('resize',resize);},[collapsed]);
       useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;if(dismiss.current)clearTimeout(dismiss.current);if(animationTimer.current)clearTimeout(animationTimer.current);};},[]);
+      useEffect(()=>{if(!visible && animationTimer.current){clearTimeout(animationTimer.current);animationTimer.current=null;setAnim(null);}},[visible]);
       useEffect(()=>{
         if(!data)return;
         const before=previousUnread.current; previousUnread.current=data.unread;
@@ -492,14 +536,14 @@ window.__ModuleLoader__.load({
         write(KEY_NOTICE,latest.id);setMenu(false);setBubble('有一条新消息，想听听吗？');
         if(dismiss.current)clearTimeout(dismiss.current);dismiss.current=setTimeout(()=>setBubble(''),10000);
       },[data?.unread,data?.settings.quiet,data?.messages]);
-      const toggle=()=>{const next=!collapsed;setCollapsed(next);write(KEY_COLLAPSED,next);setMenu(false);setBubble('');setPos(p=>{const nextPos=clamp({x:p.x,y:p.y+overlaySize(collapsed).height-overlaySize(next).height},next);write(KEY_POSITION,nextPos);return nextPos;});};
+      const toggle=()=>{const next=!collapsed;setCollapsed(next);write(KEY_COLLAPSED,next);setMenu(false);setBubble('');setPos(p=>{const nextPos=toggleOverlayPosition(p,collapsed,innerWidth,innerHeight);write(KEY_POSITION,nextPos);return nextPos;});};
       const showPanel=(tab:Tab)=>{setMenu(false);setBubble(openPanel(ctx,tab)?'':'伙伴面板暂时无法打开，请从侧边栏「陪伴伙伴」进入。');};
       const interact=async(type:'pet'|'feed')=>{
         if(actionPending.current||animationTimer.current)return;
-        actionPending.current=true;setInteracting(true);setMenu(false);setBubble('');setAnim(type);
+        actionPending.current=true;setInteracting(true);setMenu(false);setBubble('');setPlaybackId(createId());setAnim(type);
         if(dismiss.current)clearTimeout(dismiss.current);
         // Start on the click, not after the next state poll. No model is involved.
-        animationTimer.current=setTimeout(()=>{animationTimer.current=null;if(mounted.current)setAnim(null);},1700);
+        animationTimer.current=setTimeout(()=>{animationTimer.current=null;if(mounted.current)setAnim(null);},INTERACTION_MS[type]);
         try {
           const result=await send('action',{action:'interaction',type,requestId:createId()});
           if(!mounted.current)return;
@@ -516,21 +560,28 @@ window.__ModuleLoader__.load({
       const up=(e:React.PointerEvent<HTMLDivElement>)=>{const d=drag.current;if(!d||d.pointerId!==e.pointerId)return;drag.current=null;if(d.moved){suppressClick.current=true;write(KEY_POSITION,positionRef.current);setTimeout(()=>{suppressClick.current=false;},0);} };
       const menuStyle:React.CSSProperties=pos.x<100?{left:0,right:'auto'}:{};
       if(pos.y<250){menuStyle.bottom='auto';menuStyle.top='100%';menuStyle.marginTop=8;}
-      return <div className={`kw-root kw-overlay ${collapsed?'kw-collapsed':''} ${offline?'kw-offline':''}`} style={{left:pos.x,top:pos.y}} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
+      const mood=data?.companion.mood||'平静', skin=data?.settings.skin;
+      const name=data?.companion.name||'伙伴';
+      const state=offline?'离线':data?.settings.quiet?'安静陪伴':mood;
+      const artwork=data?.appearance;
+      const portrait=interactionPortrait(mood,skin,artwork,collapsed?null:anim,reduced,visible,playbackId);
+      const fallback=moodPortrait(mood,skin);
+      const description=`${name} · ${state}${data?.unread?` · ${data.unread} 条未读消息`:''}`;
+      return <div className={`kw-root kw-overlay ${collapsed?'kw-collapsed':''} ${offline?'kw-offline':''} ${skin&&!artwork?.available?'kw-custom-skin':''} ${artwork?.available?'kw-art-skin':''}`} style={{left:pos.x,top:pos.y}} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
         <style>{css}</style>
-        <button type="button" className={`kw-pet ${anim?`is-${anim}`:''}`} aria-label={collapsed?'展开伙伴':`${data?.companion.name||'伙伴'}互动菜单`} aria-expanded={menu} onClick={()=>{if(suppressClick.current)return;if(collapsed){toggle();return;}setMenu(old=>!old);setBubble('');}}>
-          {!collapsed&&<span className="kw-portrait-stage">
-            <img src={data?.settings.skin||`${PREFIX}/portrait.png`} alt="" draggable={false} onError={e=>{if(!e.currentTarget.dataset.fallback){e.currentTarget.dataset.fallback='1';e.currentTarget.src=`${PREFIX}/portrait.png`;}}}/>
-            {anim==='pet'&&<span className="kw-interaction-art kw-pat" aria-hidden="true">
+        <button type="button" className={`kw-pet ${!artwork?.available&&anim?`is-${anim}`:''}`} aria-label={collapsed?`${description}，展开伙伴`:`${description}，互动菜单`} title={collapsed?`${description} · 点击展开`:description} aria-expanded={collapsed?undefined:menu} onClick={()=>{if(suppressClick.current)return;if(collapsed){toggle();return;}setMenu(old=>!old);setBubble('');}}>
+          <span className="kw-portrait-stage">
+            <img key={portrait} src={portrait} alt="" draggable={false} onError={e=>{const image=e.currentTarget;if(!image.dataset.fallback){image.dataset.fallback='1';image.src=fallback===portrait?`${PREFIX}/portrait.png`:fallback;}else if(image.dataset.fallback==='1'){image.dataset.fallback='2';image.src=`${PREFIX}/portrait.png`;}}}/>
+            {!collapsed&&!artwork?.available&&anim==='pet'&&<span className="kw-interaction-art kw-pat" aria-hidden="true">
               <svg className="kw-pat-hand" viewBox="0 0 64 48"><path d="M57 15 36 7c-4-2-7 3-3 5l8 4-23-5c-5-1-6 5-2 6l18 5-24-3c-5 0-5 6-1 7l25 3-20 1c-5 1-4 6 0 6l24 1-8 3c-4 2-2 7 2 6l17-6c7-3 9-9 10-15Z" fill="#ffe6cf" stroke="#796073" strokeWidth="2.2" strokeLinejoin="round"/><path d="m54 12 6 2-1 15-7-2" fill="#b5e2f6" stroke="#796073" strokeWidth="2.2"/></svg>
-              <span className="kw-pat-ripple"/><span className="kw-pat-glint">✧</span>
             </span>}
-            {anim==='feed'&&<span className="kw-interaction-art kw-feed" aria-hidden="true">
+            {!collapsed&&!artwork?.available&&anim==='feed'&&<span className="kw-interaction-art kw-feed" aria-hidden="true">
               <svg className="kw-snack" viewBox="0 0 48 48"><circle cx="24" cy="24" r="19" fill="#eec18a" stroke="#966b43" strokeWidth="2.5"/><path d="M14 16h3m11-4h3m2 18h3m-20 3h3m5-12h3" stroke="#916243" strokeWidth="4" strokeLinecap="round"/><circle cx="31" cy="23" r="2" fill="#fff1d4"/></svg>
-              <span className="kw-crumb kw-crumb-one"/><span className="kw-crumb kw-crumb-two"/><span className="kw-crumb kw-crumb-three"/>
             </span>}
-          </span>}
-          <span className="kw-pet-caption"><span className="kw-dot"/>{data?.companion.name||'伙伴'} · {offline?'离线':data?.settings.quiet?'安静陪伴':data?.companion.mood||'平静'}{collapsed?' · 展开':''}</span>
+          </span>
+          {!collapsed&&<span className="kw-pet-caption"><span className="kw-dot"/>{name} · {state}</span>}
+          {collapsed&&offline&&<span className="kw-thumb-offline" aria-hidden="true"/>}
+          {collapsed&&!!data?.unread&&<span className="kw-thumb-unread" aria-hidden="true">{data.unread>99?'99+':data.unread}</span>}
         </button>
         {!collapsed&&<button className="kw-collapse" type="button" title="收起" aria-label="收起伙伴" onClick={toggle}>−</button>}
         {menu&&!collapsed&&<div className="kw-overlay-menu" style={menuStyle} aria-label="伙伴互动"><strong>{data?.companion.name||'伙伴'}</strong><div className="kw-row"><button type="button" disabled={!data||!!offline||interacting||!!anim} onClick={()=>void interact('pet')}>摸摸</button><button type="button" disabled={!data||!!offline||interacting||!!anim} onClick={()=>void interact('feed')}>喂食</button><button type="button" onClick={()=>{showPanel('chat');}}>聊聊</button><button type="button" disabled={!data||!!offline} onClick={()=>{if(data)void act('settings',{patch:{quiet:!data.settings.quiet}}).then(()=>setBubble(data.settings.quiet?'已恢复主动联系。':'已开启安静陪伴。')).catch(e=>setBubble(formatError(e)));}}>{data?.settings.quiet?'恢复关心':'安静陪我'}</button><button type="button" onClick={()=>{showPanel('settings');}}>设置</button><button type="button" onClick={()=>{const p=defaultPosition();setPos(p);write(KEY_POSITION,p);}}>重置位置</button></div></div>}

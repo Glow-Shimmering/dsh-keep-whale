@@ -17,6 +17,7 @@ export function createHandler(service:Service,assetUrl:URL) {
       const path=new URL(req.url||'','http://localhost').pathname.replace(/^\/keep-whale/,'');
       if(req.method==='GET'&&path==='/messages'){const before=new URL(req.url||'','http://localhost').searchParams.get('before')||undefined;const messages=service.store.messagePage(before);return send({messages,hasMore:messages.length===100});}
       if(req.method==='GET'&&path==='/state')return send({...service.snapshot(),token});
+      if(req.method==='GET'&&path.startsWith('/art/')){const art=service.appearance.bytes(path.slice(5),service.store.settings().skin);if(!art)return send({error:'图片暂不可用'},404);res.writeHead(200,{'content-type':art.mediaType,'cache-control':'private, no-store','x-content-type-options':'nosniff'});return res.end(art.bytes);}
       if(req.method==='GET'&&path==='/portrait.png'){res.writeHead(200,{'content-type':'image/png','cache-control':'public, max-age=3600','x-content-type-options':'nosniff'});return res.end(readFileSync(assetUrl));}
       if(req.method==='GET'&&path.startsWith('/media/')){const m=service.media.bytes(path.slice(7));res.writeHead(200,{'content-type':m.ref.mediaType,'cache-control':'private, max-age=3600','x-content-type-options':'nosniff'});return res.end(m.bytes);}
       if(req.method!=='POST')return send({error:'没有这个入口'},404);

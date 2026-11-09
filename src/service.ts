@@ -5,6 +5,7 @@ import { PROACTIVE_INSTRUCTIONS } from './core/conversation.js';
 import { Model, ModelFailure, jsonResult, requestMessage, userError } from './model.js';
 import { Media } from './media.js';
 import { Embeddings } from './embedding.js';
+import { Appearance } from './appearance.js';
 import type { Evidence, HostContext, Job, Memory, Message, Presence, RecallResult, Snapshot, Source } from './types.js';
 
 export function quietIntent(text:string):boolean|null {
@@ -17,7 +18,7 @@ export function quietIntent(text:string):boolean|null {
 const validId=(id:unknown):string=>{if(typeof id!=='string'||!id||id.length>180)throw new ModelFailure('ID','操作标识无效');return id;};
 const activeSources=(store:Store)=>store.sources().filter(s=>!s.revoked);
 export class Service {
-  readonly model:Model; readonly media:Media; readonly embeddings:Embeddings;
+  readonly model:Model; readonly media:Media; readonly embeddings:Embeddings; readonly appearance:Appearance;
   private windows=new Map<string,Presence>(); private windowSeq=new Map<string,number>(); private runningChat:AbortController|null=null;
   private background:AbortController|null=null; private taskRunning=new Set<string>(); private disposed=false;
   private lastTick=Date.now(); private timer:ReturnType<typeof setInterval>|null=null;
@@ -26,12 +27,12 @@ export class Service {
   private models:Snapshot['models']=[]; private error:string|null=null;
   private observing=new Map<string,Source>(); private startupAt=Date.now();
   private management=new Set<AbortController>();
-  constructor(readonly store:Store,readonly ctx:HostContext,root:string) { this.model=new Model(ctx,store);this.media=new Media(root,ctx);this.embeddings=new Embeddings(store,root,fetch,()=>ctx.get('credentials')); }
+  constructor(readonly store:Store,readonly ctx:HostContext,root:string) { this.model=new Model(ctx,store);this.media=new Media(root,ctx);this.embeddings=new Embeddings(store,root,fetch,()=>ctx.get('credentials'));this.appearance=new Appearance(root); }
   async start() { await this.embeddings.refresh(); await this.refreshModels(); this.timer=setInterval(()=>void this.tick().catch(()=>{this.error='后台任务暂不可用，请查看近况';}),5000);this.timer.unref?.(); }
   async refreshModels() { try{this.models=await this.model.catalog();}catch{this.models=[];} }
   snapshot():Snapshot {
     const messages=this.store.messages();
-    return {ledger:this.store.ledger(),budgetBlockers:this.store.budgetBlockers(),budgetUsage:this.store.usage(true),companion:this.store.companion(),settings:this.store.settings(),messages,memories:this.store.memories().slice(0,50),sources:[],interactions:this.store.interactions(),jobs:this.store.jobs(),usage:this.store.usage(),models:this.models,busy:!!this.runningChat,unread:messages.filter(m=>m.origin==='proactive'&&m.status==='complete'&&m.createdAt>this.store.readAt()).length,error:this.error,capability:{chat:this.model.available()&&this.models.some(m=>m.provider===this.store.settings().model?.provider&&m.model===this.store.settings().model?.model),images:this.model.imagesAvailable()&&this.models.some(m=>m.provider===this.store.settings().model?.provider&&m.model===this.store.settings().model?.model&&m.vision)},revision:this.store.previewRevision(),embedding:this.embeddings.status()};
+    return {ledger:this.store.ledger(),budgetBlockers:this.store.budgetBlockers(),budgetUsage:this.store.usage(true),companion:this.store.companion(),settings:this.store.settings(),messages,memories:this.store.memories().slice(0,50),sources:[],interactions:this.store.interactions(),jobs:this.store.jobs(),usage:this.store.usage(),models:this.models,busy:!!this.runningChat,unread:messages.filter(m=>m.origin==='proactive'&&m.status==='complete'&&m.createdAt>this.store.readAt()).length,error:this.error,capability:{chat:this.model.available()&&this.models.some(m=>m.provider===this.store.settings().model?.provider&&m.model===this.store.settings().model?.model),images:this.model.imagesAvailable()&&this.models.some(m=>m.provider===this.store.settings().model?.provider&&m.model===this.store.settings().model?.model&&m.vision)},revision:this.store.previewRevision(),embedding:this.embeddings.status(),appearance:this.appearance.status(this.store.settings().skin)};
   }
   presence(body:any) {
     const id=validId(body.windowId),now=Date.now();

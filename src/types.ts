@@ -48,6 +48,7 @@ export interface Snapshot {
   interactions: Interaction[]; jobs: Job[]; usage: Usage; models: ModelInfo[]; busy: boolean; unread: number;
   error: string | null; capability: { chat: boolean; images: boolean }; revision: number;
   embedding?: EmbeddingStatus;
+  appearance?: { available: boolean; version: string | null };
   budgetBlockers?: Ledger[];
   budgetUsage?: Usage;
 }
