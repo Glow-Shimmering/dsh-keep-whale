@@ -180,7 +180,7 @@ export class BiliService {
       const known=this.data.records('',0,500).find(r=>r.video.bvid===bvid);
       if(known&&recommendation){this.data.selectContext(known.id);throw new ModelFailure('SKIP','这条已有浏览记录，可以直接继续聊');}
       this.valid(controller,version);
-      const material=await this.provider.material(bvid,signal,label=>this.stage(attempt,label),this.data.settings().maxVideoMinutes*60,v=>!this.data.blocked(v));
+      const material=await this.provider.material(bvid,signal,label=>this.stage(attempt,label),this.data.settings().maxVideoMinutes*60,v=>{this.valid(controller,version);if(this.data.blocked(v))return false;this.current=v;this.data.updateAttempt(attempt.id,{title:v.title});return true;});
       this.current=material.video;this.data.updateAttempt(attempt.id,{title:material.video.title});
       if(this.data.blocked(material.video))throw new ModelFailure('SKIP','该视频或 UP 主已被屏蔽');
       if(!material.subtitles.length||!material.frames.length)throw new ModelFailure('READ','未取得有效字幕和画面，不会保存为看过');
