@@ -40,3 +40,16 @@ test('pet and feed events preserve user-to-companion action direction and distin
   assert.match(prompt, /companionFeedback 只是伙伴当时显示的一句短反馈，既不是用户的动作/);
   assert.match(prompt, /不凭反馈文字补写未记录的细节/);
 });
+
+test('full recall evidence stays bounded and counterexamples are not presented as supporting quotes', () => {
+  const companion:Companion={id:'bounded',name:'伙伴',mood:'平静',createdAt:1};
+  const sources:Source[]=Array.from({length:60},(_,i)=>({id:'s'+i,kind:'user_fact',text:'支持原文'.repeat(180),occasion:'o'+i,createdAt:1,processed:true,revoked:false}));
+  sources.push({id:'counter',kind:'user_fact',text:'这次你没有听懂',occasion:'counter',createdAt:2,processed:true,revoked:false});
+  const memories:Memory[]=Array.from({length:10},(_,i)=>({id:'m'+i,kind:'understanding',text:'暂定理解'.repeat(250),sourceIds:[...sources.slice(i*6,i*6+6).map(s=>s.id),'counter'],evidence:sources.slice(i*6,i*6+6).map(s=>({sourceId:s.id,quote:s.text})),counterEvidence:[{sourceId:'counter',quote:'这次你没有听懂'}],createdAt:1,updatedAt:1}));
+  const prompt=buildSystem(companion,DEFAULT_SETTINGS,memories,sources,[]);
+  const json=prompt.split('\n').find(line=>line.startsWith('【可用记忆及来源】'))!.slice('【可用记忆及来源】'.length);
+  const included=JSON.parse(json);
+  assert.ok(included.length>0&&included.length<10);
+  assert.ok(json.length<=16050,'serialized memory and evidence payload must stay bounded');
+  for(const item of included){assert.ok(item.counterEvidence.some((e:any)=>e.quote==='这次你没有听懂'));assert.ok(item.evidence.every((e:any)=>e.excerpt!=='这次你没有听懂'));}
+});

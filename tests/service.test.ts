@@ -23,13 +23,13 @@ test('private chat streams through llm without native session and feed is known 
  await x.service.action({action:'chat',requestId:'req-1',text:'你知道我刚才做什么了吗？',imageIds:[]});await waitFor(()=>!x.service.snapshot().busy);
  assert.equal(x.calls.length,1);assert.equal(x.calls[0].sessionId,undefined);assert.match(x.calls[0].system,/用户喂食/);assert.equal(x.store.messages().length,2);assert.equal(x.store.messages()[1].status,'complete');
  await x.service.action({action:'chat',requestId:'req-1',text:'重复网络请求',imageIds:[]});assert.equal(x.calls.length,1);
- assert.equal(x.store.sources().length,2);
+ assert.equal(x.store.sources().length,3);assert.equal(x.store.sources().filter(s=>s.provenance==='behavior').length,1);
  }finally{await x.close();}});
 test('truncated replies do not become learning evidence; retry keeps original user message and bills separate attempt',async()=>{const x=setup();try{
  x.setReason('max-tokens');await x.service.action({action:'chat',requestId:'r',text:'你好',imageIds:[]});await waitFor(()=>!x.service.snapshot().busy);
- const a=x.store.messages().find(m=>m.role==='assistant')!;assert.equal(a.status,'failed');assert.equal(x.store.sources().length,0);
+ const a=x.store.messages().find(m=>m.role==='assistant')!;assert.equal(a.status,'failed');assert.equal(x.store.sources().length,1);assert.equal(x.store.sources()[0].kind,'user_fact');assert.equal(x.store.sources().some(s=>s.provenance==='behavior'),false);
  x.setReason('stop');await x.service.action({action:'retry',messageId:a.id,requestId:'retry'});await waitFor(()=>!x.service.snapshot().busy);
- assert.equal(x.store.messages().length,2);assert.equal(x.calls[1].maxTokens,8192);assert.equal(x.store.ledger().length,2);assert.equal(x.store.sources().length,2);
+ assert.equal(x.store.messages().length,2);assert.equal(x.calls[1].maxTokens,8192);assert.equal(x.store.ledger().length,2);assert.equal(x.store.sources().length,3);assert.equal(x.store.sources().filter(s=>s.provenance==='behavior').length,1);
  }finally{await x.close();}});
 test('explicit quiet boundary applies before model work, quoted or hypothetical statements do not',async()=>{const x=setup();try{
  assert.equal(quietIntent('今天别主动提醒我，我想安静一会儿'),true);assert.equal(quietIntent('不主动提醒我'),true);assert.equal(quietIntent('我不希望你只会附和'),null);assert.equal(quietIntent('她说“不要主动提醒我”'),null);
@@ -76,4 +76,42 @@ test('proactive delivery writes only one assistant message per occasion and neve
 test('only local imported media can be selected as a skin',async()=>{const x=setup();try{
  assert.throws(()=>x.store.patchSettings({skin:'https://example.com/tracking.png'}));assert.throws(()=>x.store.patchSettings({skin:'file:///private/test.png'}));
  x.store.patchSettings({skin:'/keep-whale/media/11111111-1111-1111-1111-111111111111'});assert.match(x.store.settings().skin!,/^\/keep-whale/);
+ }finally{await x.close();}});
+
+test('topic recall finds an old grounded event instead of unrelated latest memories',async()=>{const x=setup();try{
+ const add=(id:string,text:string,when:number)=>{x.store.addSource({id,kind:'user_fact',text,occasion:id,createdAt:when,processed:false,revoked:false});return x.store.saveMemory({kind:'user_fact',text,sourceIds:[id],evidence:[{sourceId:id,quote:text}]})!;};
+ const old=add('exam','我参加过海洋大学面试，面试官问了并发编程',Date.now()-180*86400000);
+ for(let i=0;i<45;i++)add('recent'+i,'今日早餐是面包和牛奶，第'+i+'条',Date.now()+i);
+ await x.service.action({action:'chat',requestId:'recall-old',text:'海洋大学面试问了什么？',imageIds:[]});await waitFor(()=>!x.service.snapshot().busy);
+ assert.ok(x.calls[0].system.includes(old.text));assert.ok(!x.calls[0].system.includes('第44条'));assert.equal(x.store.ledger().length,1);
+ }finally{await x.close();}});
+
+test('management search, evidence details and personality correction never write chat messages',async()=>{const x=setup();try{
+ const src={id:'fact',kind:'user_fact' as const,text:'那次我更希望你解释理由',occasion:'one',createdAt:Date.now(),processed:false,revoked:false};x.store.addSource(src);
+ const m=x.store.saveMemory({kind:'understanding',text:'用户可能更重视解释理由',sourceIds:[src.id],evidence:[{sourceId:src.id,quote:src.text}],status:'uncertain'})!;
+ const page=await x.service.action({action:'memory.list',query:'解释理由',limit:10});assert.equal(page.total,1);
+ const detail=await x.service.action({action:'memory.detail',id:m.id});assert.equal(detail.sources[0].text,src.text);
+ await assert.rejects(x.service.action({action:'memory.edit',id:m.id,text:'立刻变成指定人格'}));
+ await x.service.action({action:'memory.correct',id:m.id,text:'这是针对那道题的要求，不是对所有聊天的期待'});
+ assert.equal(x.store.messages().length,0);assert.equal(x.calls.length,0);
+ const profile=await x.service.action({action:'memory.profile'});assert.equal(profile.tendencies.length,0);assert.ok(profile.tentative.length>=1);
+ }finally{await x.close();}});
+
+test('deleted evidence is absent from the next model context while original chat stays visible',async()=>{const x=setup();try{
+ await x.service.action({action:'chat',requestId:'private-fact',text:'我的秘密代号是海蓝石',imageIds:[]});await waitFor(()=>!x.service.snapshot().busy);
+ const s=x.store.sources().find(s=>s.kind==='user_fact')!;
+ const m=x.store.saveMemory({kind:'user_fact',text:'用户秘密代号是海蓝石',sourceIds:[s.id],evidence:[{sourceId:s.id,quote:s.text}]})!;
+ const preview=await x.service.action({action:'memory.preview',ids:[m.id]});await x.service.action({action:'memory.delete',ids:preview.ids,revision:preview.revision,confirm:true});
+ assert.ok(x.store.messages().some(m=>m.text.includes('海蓝石')));
+ await x.service.action({action:'chat',requestId:'after-delete',text:'我们来聊聊春天',imageIds:[]});await waitFor(()=>!x.service.snapshot().busy);
+ assert.doesNotMatch(JSON.stringify({system:x.calls[1].system,messages:x.calls[1].messages}),/海蓝石/);
+ }finally{await x.close();}});
+
+test('memory truncation retries only a smaller batch and leaves other sources eligible',async()=>{const x=setup();try{
+ for(let i=0;i<8;i++)x.store.addSource({id:'batch'+i,kind:'user_fact',text:'独立信息'+i,occasion:'occasion'+i,createdAt:Date.now()+i,processed:false,revoked:false});
+ let n=0;x.llm.stream=async function*(options:any){x.calls.push(options);n++;yield {type:'text-delta',text:JSON.stringify({memories:[]})};yield {type:'usage',usage:{inputTokens:200,outputTokens:80,cacheReadTokens:0,cacheWriteTokens:0}};yield {type:'finish',reason:{kind:n===1?'max-tokens':'stop'}};};
+ await x.service.tick();assert.equal(x.calls.length,2);
+ assert.equal(JSON.parse(x.calls[0].messages[0].content[0].text).newSources.length,8);assert.equal(JSON.parse(x.calls[1].messages[0].content[0].text).newSources.length,4);
+ assert.equal(x.store.pendingSources().length,4);
+ await x.service.tick();assert.equal(x.calls.length,3);assert.equal(x.store.pendingSources().length,0);
  }finally{await x.close();}});

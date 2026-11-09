@@ -1,15 +1,16 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, chmodSync } from 'node:fs';
+import { mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Companion, Interaction, Job, Ledger, Memory, MemoryKind, Message, Settings, Source, Usage } from '../types.js';
+import type { Companion, Interaction, Job, Ledger, Memory, MemoryKind, Message, Settings, Source, Usage, MemoryInput, MemoryRelation, RecallResult, RecallHit, MemoryQuery, MemoryPage, MemoryDetail, DeletePreview, PersonalityProfile, Evidence, CostDetails } from '../types.js';
+import { searchTerms, indexText, cosine, recencyWeight, isHistoricalQuery } from './memory.js';
 import { interactionFeedback } from './interaction.js';
 
 const DAY_MS = 86_400_000;
 /** The product's budget and evidence day follows Beijing time, independent of host locale. */
 export function beijingDay(timestamp: number): string { return new Date(timestamp + 8 * 3_600_000).toISOString().slice(0, 10); }
 export const DEFAULT_SETTINGS: Settings = {
-  model: null, priceRoute: null, prices: null, unit: '积分', pointsPerYuan: null, dailyLimit: 100,
+  model: null, priceRoute: null, prices: null, unit: '积分', pointsPerYuan: null, dailyLimit: 100, embedding: null,
   observeEnabled: false, observeSince: 0, excludedSessions: [], excludedWorkspaces: [],
   backgroundEnabled: true, proactiveEnabled: true, quiet: false, skin: null,
 };
@@ -32,12 +33,24 @@ export class Store {
   private readonly db: DatabaseSync;
   private readonly clock: () => number;
   private closed = false;
+  private ftsAvailable = false;
 
   constructor(root: string, now: () => number = Date.now) {
     this.clock = now;
     mkdirSync(root, { recursive: true, mode: 0o700 });
     const path = join(root, 'keep-whale.sqlite');
+    const existed = existsSync(path);
     this.db = new DatabaseSync(path);
+    if (existed) {
+      try {
+        const version = Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+        if (version < 2) {
+          const backup = join(root, `keep-whale.before-memory-network-${randomUUID()}.sqlite`);
+          this.db.prepare('VACUUM INTO ?').run(backup);
+          chmodSync(backup, 0o600);
+        }
+      } catch (error) { this.db.close(); throw error; }
+    }
     try { chmodSync(path, 0o600); } catch { /* The host may impose stricter permissions. */ }
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -45,21 +58,45 @@ export class Store {
       CREATE INDEX IF NOT EXISTS messages_time ON messages(created_at);
       CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, processed INTEGER NOT NULL DEFAULT 0, revoked INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS sources_pending ON sources(revoked,processed,created_at);
+      CREATE INDEX IF NOT EXISTS sources_occasion ON sources(json_extract(data,'$.occasion')) WHERE revoked=0;
       CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS memories_topic ON memories(json_extract(data,'$.topicKey'));
       CREATE TABLE IF NOT EXISTS interactions (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS interaction_time ON interactions(created_at);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS ledger (id TEXT PRIMARY KEY, day TEXT NOT NULL, job_id TEXT NOT NULL UNIQUE, background INTEGER NOT NULL, unit TEXT NOT NULL DEFAULT '', reserved REAL NOT NULL, actual REAL, status TEXT NOT NULL, created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS ledger_day ON ledger(day,background,status);
     `);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS memory_links (memory_id TEXT NOT NULL, source_id TEXT NOT NULL, quote TEXT NOT NULL DEFAULT '', start_offset INTEGER, end_offset INTEGER, counter INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(memory_id,source_id,quote,counter));
+      CREATE INDEX IF NOT EXISTS memory_links_source ON memory_links(source_id);
+      CREATE TABLE IF NOT EXISTS memory_relations (id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS memory_relations_from ON memory_relations(from_id);
+      CREATE INDEX IF NOT EXISTS memory_relations_to ON memory_relations(to_id);
+      CREATE TABLE IF NOT EXISTS memory_vectors (memory_id TEXT NOT NULL, version INTEGER NOT NULL, route_key TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(memory_id,route_key));
+      CREATE TABLE IF NOT EXISTS source_redactions (source_id TEXT NOT NULL, start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL, quote TEXT NOT NULL, PRIMARY KEY(source_id,start_offset,end_offset));
+      CREATE TABLE IF NOT EXISTS memory_history (id TEXT NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(id,version));
+    `);
+    try { this.db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, terms, tokenize='unicode61')"); this.ftsAvailable = true; } catch { this.ftsAvailable = false; }
     const columns = this.db.prepare('PRAGMA table_info(ledger)').all();
     if (!columns.some(column => column.name === 'unit')) this.db.exec("ALTER TABLE ledger ADD COLUMN unit TEXT NOT NULL DEFAULT ''");
+    if (!columns.some(column => column.name === 'details')) this.db.exec("ALTER TABLE ledger ADD COLUMN details TEXT");
     this.transaction(() => {
       if (!this.getMeta<Companion>('companion')) this.setMeta('companion', { id: randomUUID(), name: '大肥鱼', mood: '平静', createdAt: this.clock() } satisfies Companion);
       if (!this.getMeta<Settings>('settings')) this.setMeta('settings', DEFAULT_SETTINGS);
       if (this.getMeta<number>('revision') === undefined) this.setMeta('revision', 0);
+      if (this.getMeta<number>('previewRevision') === undefined) this.setMeta('previewRevision', 0);
       if (this.getMeta<number>('readAt') === undefined) this.setMeta('readAt', 0);
       this.db.prepare("UPDATE ledger SET unit=? WHERE unit=''").run(this.settings().unit);
+      const schema = Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+      const count = Number(this.db.prepare('SELECT COUNT(*) AS n FROM memories').get()?.n ?? 0);
+      const indexed = this.ftsAvailable ? Number(this.db.prepare('SELECT COUNT(*) AS n FROM memory_fts').get()?.n ?? 0) : count;
+      if (schema < 2 || indexed !== count) {
+        for (const row of this.db.prepare('SELECT data FROM memories').all()) {
+          const memory = parse<Memory>(row.data);
+          this.reindexMemory(memory);
+        }
+        this.db.exec('PRAGMA user_version=2');
+      }
     });
   }
   close(): void { if (!this.closed) { this.db.close(); this.closed = true; } }
@@ -76,15 +113,87 @@ export class Store {
     this.db.prepare('INSERT INTO meta(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data').run(key, JSON.stringify(value));
   }
   revision(): number { return this.getMeta<number>('revision') ?? 0; }
-  private bump(): void { this.setMeta('revision', this.revision() + 1); }
+  private bump(): void { this.setMeta('revision', this.revision() + 1); this.bumpPreview(); }
+  previewRevision(): number { return this.getMeta<number>('previewRevision') ?? 0; }
+  private bumpPreview(): void { this.setMeta('previewRevision', this.previewRevision() + 1); }
+  private reindexMemory(memory: Memory): void {
+    this.db.prepare('DELETE FROM memory_links WHERE memory_id=?').run(memory.id);
+    const evidence = [...(memory.evidence ?? []).map(e => ({ ...e, counter: 0 })), ...(memory.counterEvidence ?? []).map(e => ({ ...e, counter: 1 }))];
+    const linked = new Set(evidence.map(e => e.sourceId));
+    for (const sourceId of memory.sourceIds) if (!linked.has(sourceId)) evidence.push({ sourceId, quote: '', counter: 0 });
+    const insert = this.db.prepare('INSERT OR IGNORE INTO memory_links(memory_id,source_id,quote,start_offset,end_offset,counter) VALUES(?,?,?,?,?,?)');
+    for (const e of evidence) insert.run(memory.id, e.sourceId, e.quote, e.start ?? null, e.end ?? null, e.counter);
+    if (this.ftsAvailable) {
+      this.db.prepare('DELETE FROM memory_fts WHERE id=?').run(memory.id);
+      this.db.prepare('INSERT INTO memory_fts(id,terms) VALUES(?,?)').run(memory.id, indexText(memory.text + ' ' + (memory.topicKey ?? '') + ' ' + [...(memory.evidence??[]),...(memory.counterEvidence??[])].map(e=>e.quote).join(' ')));
+    }
+  }
+  /** Build only bounded retrieval edges backed by source occasions or an explicit subject:topic key. */
+  private linkNearby(memory: Memory): void {
+    const evidence=(memory.evidence??[]).filter(e=>!!this.sourceById(e.sourceId) && !this.sourceById(e.sourceId)!.revoked);
+    if(!evidence.length)return; // Do not manufacture provenance for legacy entries.
+    const occasions=new Set(evidence.map(e=>this.sourceById(e.sourceId)!.occasion));
+    const topic=(key:string|undefined) => {
+      if(!key)return null;
+      const clean=key.normalize('NFKC').trim().toLocaleLowerCase();
+      const match=/^([^:：|/·]{1,40})[:：|/·](.{1,120})$/u.exec(clean);
+      if(!match || /^(?:兴趣|偏好|主题|看法|日常|一般|其他|general|topic)$/i.test(match[1].trim()))return null;
+      return match[1].trim()+':'+match[2].trim();
+    };
+    const key=topic(memory.topicKey);
+    const statement=this.db.prepare('INSERT INTO memory_relations(id,from_id,to_id,kind,data) VALUES(?,?,?,?,?)');
+    const create=(other:Memory,kind:'same_event'|'related', proof:Evidence[]) => {
+      const relation:MemoryRelation={id:randomUUID(),fromId:memory.id,toId:other.id,kind,evidence:proof,createdAt:this.clock()};
+      statement.run(relation.id,relation.fromId,relation.toId,relation.kind,JSON.stringify(relation));
+    };
+    const items=[...occasions];
+    const marks=items.map(()=>'?').join(',');
+    if(items.length) {
+      const sql=`SELECT DISTINCT memories.data,memories.updated_at FROM memories JOIN memory_links ON memory_links.memory_id=memories.id JOIN sources ON sources.id=memory_links.source_id WHERE memories.id<>? AND sources.revoked=0 AND memory_links.counter=0 AND memory_links.quote<>'' AND json_extract(sources.data,'$.occasion') IN (${marks}) ORDER BY memories.updated_at DESC LIMIT 3`;
+      for(const other of dataFromRows<Memory>(this.db.prepare(sql).all(memory.id,...items))) {
+        if(other.status==='superseded')continue;
+        const found=(other.evidence??[]).find(e=>{const source=this.sourceById(e.sourceId);return !!source&&!source.revoked&&occasions.has(source.occasion);});
+        if(!found)continue;
+        const shared=this.sourceById(found.sourceId)!.occasion;
+        const first=evidence.find(e=>this.sourceById(e.sourceId)!.occasion===shared)!;
+        create(other,'same_event',[first,found]);
+      }
+    }
+    if(key && memory.topicKey) {
+      const candidates=dataFromRows<Memory>(this.db.prepare("SELECT data FROM memories WHERE id<>? AND json_extract(data,'$.topicKey')=? ORDER BY updated_at DESC LIMIT 50").all(memory.id,memory.topicKey));
+      let count=0;
+      for(const other of candidates) {
+        if(other.status==='superseded'||!other.evidence?.length||topic(other.topicKey)!==key)continue;
+        if(!other.evidence.some(e=>{const source=this.sourceById(e.sourceId);return !!source&&!source.revoked;}))continue;
+        create(other,'related',[]);if(++count>=3)break; // retrieval only, never evidence
+      }
+    }
+  }
+  private getMemory(id: string): Memory | undefined {
+    const row = this.db.prepare('SELECT data FROM memories WHERE id=?').get(id);
+    return row ? parse<Memory>(row.data) : undefined;
+  }
+  private putMemory(memory: Memory): void {
+    this.db.prepare('INSERT INTO memories(id,updated_at,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,data=excluded.data').run(memory.id,memory.updatedAt,JSON.stringify(memory));
+    this.reindexMemory(memory);
+  }
+  private archiveMemory(memory: Memory): void {
+    this.db.prepare('INSERT OR IGNORE INTO memory_history(id,version,data) VALUES(?,?,?)').run(memory.id,memory.version ?? 1,JSON.stringify(memory));
+  }
+  eligibleSource(source: Source): boolean { return this.isEligible(source,this.settings()); }
   companion(): Companion { return copy(this.getMeta<Companion>('companion')!); }
   rename(name: string): Companion {
     const valid = bounded(name, '伙伴名字', 32);
     return this.transaction(() => { const current = this.companion(); current.name = valid; this.setMeta('companion', current); return current; });
   }
-  setMood(value: string): Companion {
+  setMood(value: string, evidence?: { at: number; reason: string; sourceIds: string[] }): Companion {
     const mood = bounded(value, '心情', 24);
-    return this.transaction(() => { const current = this.companion(); current.mood = mood; this.setMeta('companion', current); return current; });
+    return this.transaction(() => {
+      if (evidence && (!Number.isFinite(evidence.at) || !evidence.reason.trim() || !evidence.sourceIds.length || evidence.sourceIds.some(id => {const s=this.sourceById(id);return !s || s.revoked || s.kind==='observed_dialogue'&&!this.isEligible(s,this.settings());}))) throw new Error('心情依据无效');
+      const current = this.companion(); current.mood = mood;
+      if (evidence) current.moodEvidence = copy(evidence); else delete current.moodEvidence;
+      this.setMeta('companion', current); return current;
+    });
   }
   settings(): Settings { return { ...copy(DEFAULT_SETTINGS), ...copy(this.getMeta<Settings>('settings') || DEFAULT_SETTINGS) }; }
   patchSettings(patch: Partial<Settings>): Settings {
@@ -105,6 +214,11 @@ export class Store {
       for (const key of ['excludedSessions', 'excludedWorkspaces'] as const) {
         if (!Array.isArray(next[key]) || next[key].length > 2000 || next[key].some(item => typeof item !== 'string' || !item.trim() || item.length > 4096)) throw new Error('排除范围无效');
         next[key] = [...new Set(next[key].map(x => x.trim()))];
+      }
+      if (next.embedding != null) {
+        const e=next.embedding;
+        let endpoint: URL; try { endpoint=new URL(e.endpoint); } catch { throw new Error('Embedding 地址无效'); }
+        if (typeof e.enabled!=='boolean' || !['http:','https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || !e.model.trim() || !Number.isSafeInteger(e.dimensions) || e.dimensions<1 || e.dimensions>16384 || !numberAtLeastZero(e.inputPrice) || !e.unit.trim() || e.unitsPerYuan!==null && (!numberAtLeastZero(e.unitsPerYuan) || e.unitsPerYuan===0)) throw new Error('Embedding 配置无效');
       }
       if (next.skin !== null && (typeof next.skin !== 'string' || !/^\/keep-whale\/media\/[0-9a-f-]{36}$/.test(next.skin))) throw new Error('皮肤无效');
       if (!before.observeEnabled && next.observeEnabled) next.observeSince = this.clock();
@@ -164,7 +278,7 @@ export class Store {
       const sourceIds = new Set<string>();
       for (const row of this.db.prepare('SELECT id FROM sources WHERE revoked=0').all()) {
         const sourceId = String(row.id);
-        if (userIds.some(id => sourceId === `chat:${id}` || sourceId.startsWith(`chat:${id}:`) || sourceId === `episode:${id}` || sourceId.startsWith(`episode:${id}:`))) sourceIds.add(sourceId);
+        if (userIds.some(id => sourceId === `chat:${id}` || sourceId.startsWith(`chat:${id}:`) || sourceId === `episode:${id}` || sourceId.startsWith(`episode:${id}:`) || sourceId === `behavior:${id}` || sourceId.startsWith(`behavior:${id}:`))) sourceIds.add(sourceId);
       }
       this.retractInside([], sourceIds);
       const remove = this.db.prepare('DELETE FROM messages WHERE request_id=?');
@@ -174,7 +288,26 @@ export class Store {
   }
   private sourceById(id: string): Source | undefined {
     const row = this.db.prepare('SELECT data,processed,revoked FROM sources WHERE id=?').get(id); if (!row) return undefined;
-    return { ...parse<Source>(row.data), processed: !!row.processed, revoked: !!row.revoked };
+    const source = { ...parse<Source>(row.data), processed: !!row.processed, revoked: !!row.revoked };
+    const redactions = this.db.prepare('SELECT start_offset,end_offset FROM source_redactions WHERE source_id=? ORDER BY start_offset DESC').all(id);
+    if (redactions.length) {
+      for (const r of redactions) source.text = source.text.slice(0,Number(r.start_offset)) + '█'.repeat(Number(r.end_offset)-Number(r.start_offset)) + source.text.slice(Number(r.end_offset));
+      // Context may repeat the removed text and cannot be safely attributed after redaction.
+      delete source.context;
+    }
+    return source;
+  }
+  messageForModel(id: string): Message | undefined {
+    const message=this.getMessage(id); if (!message) return undefined;
+    const user=message.role==='user'?message:this.findRequest(message.requestId,'user');
+    if (!user) return message;
+    const sourceId='chat:'+user.id;
+    const sourceRow=this.db.prepare('SELECT revoked FROM sources WHERE id=?').get(sourceId);
+    if(sourceRow && sourceRow.revoked) { message.text='[相关记忆已删除]'; return message; }
+    const rows=this.db.prepare('SELECT start_offset,end_offset,quote FROM source_redactions WHERE source_id=? ORDER BY start_offset DESC').all(sourceId);
+    if (message.role==='user') for (const r of rows) message.text=message.text.slice(0,Number(r.start_offset))+'█'.repeat(Number(r.end_offset)-Number(r.start_offset))+message.text.slice(Number(r.end_offset));
+    else for (const r of rows) if (r.quote) message.text=message.text.split(String(r.quote)).join('[已删除]');
+    return message;
   }
   private isEligible(source: Source, settings: Settings): boolean {
     if (source.revoked) return false;
@@ -190,15 +323,18 @@ export class Store {
       const next = { ...source, processed: false, revoked: false };
       if (!this.isEligible(next, this.settings())) return false;
       const result = this.db.prepare('INSERT OR IGNORE INTO sources(id,created_at,processed,revoked,data) VALUES(?,?,0,0,?)').run(next.id, next.createdAt, JSON.stringify(next));
+      if(Number(result.changes)) this.bumpPreview();
       return Number(result.changes) > 0;
     });
   }
-  pendingSources(limit = 12): Source[] {
+  pendingSources(limit = 12, options: {unattempted?:boolean} = {}): Source[] {
     const n = Math.max(1, Math.min(100, Math.floor(limit)));
     // A bounded recent set avoids loading archived content; filtering happens before taking the requested count.
     const rows = this.db.prepare('SELECT id FROM sources WHERE revoked=0 AND processed=0 ORDER BY created_at ASC').all();
     const settings = this.settings();
-    return rows.map(row => this.sourceById(String(row.id))!).filter(source => source && this.isEligible(source, settings)).slice(0, n);
+    const found:Source[]=[];
+    for(const row of rows) { const source=this.sourceById(String(row.id)); if(source && this.isEligible(source,settings) && (!options.unattempted || !this.hasSourceJob('memory',[source.id]))) found.push(source); if(found.length>=n)break; }
+    return found;
   }
   markProcessed(ids: string[]): void {
     if (!ids.length) return;
@@ -208,58 +344,257 @@ export class Store {
       void changed;
     });
   }
-  memories(): Memory[] { return dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories ORDER BY updated_at DESC LIMIT 5000').all()); }
-  saveMemory(input: { kind: MemoryKind; text: string; sourceIds: string[] }, expectedRevision?: number): Memory | null {
-    if (!['user_fact', 'shared_episode', 'observed_dialogue', 'tendency'].includes(input.kind)) throw new Error('记忆类型无效');
+  memories(): Memory[] { return dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories ORDER BY updated_at DESC').all()); }
+  private validatedEvidence(items: Evidence[] | undefined, allowedIds: string[]): Evidence[] | null {
+    if (items === undefined) return [];
+    if (!Array.isArray(items) || items.length > 100) return null;
+    const result: Evidence[] = [];
+    for (const item of items) {
+      if (!item || !allowedIds.includes(item.sourceId) || typeof item.quote !== 'string' || !item.quote.trim() || /█/.test(item.quote) || item.quote.length > 4000) return null;
+      const source = this.sourceById(item.sourceId); if (!source || source.revoked) return null;
+      const start = item.start === undefined ? source.text.indexOf(item.quote) : item.start;
+      const end = item.end === undefined ? start + item.quote.length : item.end;
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || source.text.slice(start,end) !== item.quote) return null;
+      result.push({ sourceId: item.sourceId, quote: item.quote, start, end });
+    }
+    return result;
+  }
+  saveMemory(input: MemoryInput, expectedRevision?: number): Memory | null {
+    if (!['user_fact', 'shared_episode', 'observed_dialogue', 'understanding', 'tendency'].includes(input.kind)) throw new Error('记忆类型无效');
     const value = bounded(input.text, '记忆内容', 4000);
     if (!Array.isArray(input.sourceIds) || input.sourceIds.length < 1 || input.sourceIds.length > 100) throw new Error('记忆需要有效来源');
     const sourceIds = [...new Set(input.sourceIds)];
     return this.transaction(() => {
       if (expectedRevision !== undefined && expectedRevision !== this.revision()) return null;
       const sources = sourceIds.map(id => this.sourceById(id));
-      if (sources.some(source => !source || !this.isEligible(source, this.settings()) || source.kind === 'interaction')) return null;
+      if (sources.some(source => !source || source.revoked || source.kind === 'interaction' || source.kind === 'observed_dialogue' && !this.isEligible(source, this.settings()))) return null;
       const valid = sources as Source[];
-      if (input.kind === 'user_fact' && valid.some(s => s.kind !== 'user_fact')) return null;
-      if (input.kind === 'observed_dialogue' && valid.some(s => s.kind !== 'observed_dialogue')) return null;
-      if (input.kind === 'shared_episode' && valid.some(s => s.kind !== 'shared_episode')) return null;
-      if (input.kind === 'tendency' && (new Set(valid.map(s => s.occasion)).size < 3 || new Set(valid.map(s => beijingDay(s.createdAt))).size < 2)) return null;
-      const now = this.clock(); const memory: Memory = { id: randomUUID(), kind: input.kind, text: value, sourceIds, createdAt: now, updatedAt: now };
-      this.db.prepare('INSERT INTO memories(id,updated_at,data) VALUES(?,?,?)').run(memory.id, now, JSON.stringify(memory)); return memory;
+      const evidence = this.validatedEvidence(input.evidence,sourceIds); const counters = this.validatedEvidence(input.counterEvidence,sourceIds);
+      if (!evidence || !counters) return null;
+      const positive=valid.filter(s=>!counters.some(c=>c.sourceId===s.id) || evidence.some(e=>e.sourceId===s.id));
+      if (input.kind === 'user_fact' && positive.some(s => s.kind !== 'user_fact' || s.provenance === 'behavior')) return null;
+      if (input.kind === 'observed_dialogue' && positive.some(s => s.kind !== 'observed_dialogue')) return null;
+      if (input.kind === 'shared_episode' && positive.some(s => s.kind !== 'shared_episode' || s.provenance === 'behavior')) return null;
+      if (input.kind === 'tendency') {
+        const supporting = evidence.filter(e => !counters.some(c => c.sourceId === e.sourceId));
+        if (new Set(supporting.map(e=>e.sourceId)).size !== sourceIds.filter(id => !counters.some(c => c.sourceId === id)).length || new Set(supporting.map(e=>e.sourceId)).size < 3) return null;
+        const facts = supporting.map(e => ({ evidence:e, source: valid.find(s => s.id === e.sourceId)! }));
+        if (facts.some(({evidence,source}) => source.provenance === 'behavior' && /(?:我一直|我(?:已经|现在|从此|正在)?(?:变得|变成|改变|成长|进步|不再像以前))/.test(evidence.quote) || source.provenance !== 'behavior' && /希望你|想让你|请你(?:变|要|更|温柔)|要求你|你(?:应该|要|必须)(?:变|更|温柔|有主见)/.test(evidence.quote))) return null;
+        if (new Set(facts.map(({source}) => source.occasion)).size < 3 || new Set(facts.map(({source}) => beijingDay(source.createdAt))).size < 2) return null;
+      }
+      if (input.parentMemoryIds?.some(id => !this.getMemory(id))) return null;
+      const now = this.clock();
+      const normalized = (text:string) => text.normalize('NFKC').trim().replace(/\s+/g,' ');
+      const existing = dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories').all()).find(m => m.kind === input.kind && normalized(m.text) === normalized(value) && (m.topicKey ?? '') === (input.topicKey ?? ''));
+      if (existing) {
+        const mergedEvidence = [...(existing.evidence ?? []),...evidence].filter((e,i,a) => a.findIndex(v=>v.sourceId===e.sourceId && v.quote===e.quote)===i);
+        const mergedCounters = [...(existing.counterEvidence ?? []),...counters].filter((e,i,a) => a.findIndex(v=>v.sourceId===e.sourceId && v.quote===e.quote)===i);
+        const mergedIds=[...new Set([...existing.sourceIds,...sourceIds])];
+        if(mergedIds.length===existing.sourceIds.length && mergedEvidence.length===(existing.evidence??[]).length && mergedCounters.length===(existing.counterEvidence??[]).length) return existing;
+        this.archiveMemory(existing);
+        const memory: Memory = {...existing,sourceIds:mergedIds,evidence:mergedEvidence,counterEvidence:mergedCounters,updatedAt:now,reinforcedAt:now,version:(existing.version??1)+1,status:mergedCounters.length?'uncertain':input.status??existing.status??'active'};
+        this.putMemory(memory); this.db.prepare('DELETE FROM memory_vectors WHERE memory_id=?').run(memory.id); this.bumpPreview(); return memory;
+      }
+      const memory: Memory = { id: randomUUID(), kind: input.kind, text: value, sourceIds, createdAt: now, updatedAt: now, version:1, evidence, counterEvidence:counters, parentMemoryIds:input.parentMemoryIds ?? [], status:counters.length?'uncertain':input.status??'active', validFrom:input.validFrom, validTo:input.validTo, boundary:input.boundary, topicKey:input.topicKey, reinforcedAt:now };
+      this.putMemory(memory);
+      for (const parentId of memory.parentMemoryIds ?? []) {
+        const relation: MemoryRelation = {id:randomUUID(),fromId:memory.id,toId:parentId,kind:'derived_from',evidence:[],createdAt:now};
+        this.db.prepare('INSERT INTO memory_relations(id,from_id,to_id,kind,data) VALUES(?,?,?,?,?)').run(relation.id,relation.fromId,relation.toId,relation.kind,JSON.stringify(relation));
+      }
+      this.linkNearby(memory);
+      this.bumpPreview(); return memory;
     });
   }
-  private retractInside(ids: string[], sourceIds = new Set<string>()): void {
-    const targets = new Set(ids);
-    const memories = dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories').all());
-    for (const id of memories.filter(m => targets.has(m.id)).flatMap(m => m.sourceIds)) sourceIds.add(id);
-    // A single user message produces both user-fact and episode evidence. Revoke
-    // both views when either one is deleted so the other cannot recreate it.
-    for (const id of [...sourceIds]) {
-      if (id.startsWith('chat:')) sourceIds.add('episode:' + id.slice('chat:'.length));
-      else if (id.startsWith('episode:')) sourceIds.add('chat:' + id.slice('episode:'.length));
+  private deletionImpact(ids: string[], forced = new Set<string>()): { targets: Set<string>; whole: Set<string>; spans: Evidence[] } {
+    const memories=dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories').all());
+    const byId=new Map(memories.map(m=>[m.id,m]));
+    const targets=new Set(ids.filter(id=>byId.has(id))); const whole=new Set(forced); const spans:Evidence[]=[];
+    for (const id of targets) {
+      const memory=byId.get(id)!; const evidence=[...(memory.evidence??[]),...(memory.counterEvidence??[])];
+      for (const sid of memory.sourceIds) {
+        const supporting=evidence.filter(e=>e.sourceId===sid && e.start!==undefined && e.end!==undefined);
+        if (supporting.length) spans.push(...supporting); else whole.add(sid);
+      }
     }
-    // All derived entries sharing revoked evidence must disappear too; never hide an active derivative.
-    for (const memory of memories) if (targets.has(memory.id) || memory.sourceIds.some(id => sourceIds.has(id))) targets.add(memory.id);
-    const revoke = this.db.prepare('UPDATE sources SET revoked=1 WHERE id=?');
-    for (const id of sourceIds) revoke.run(id);
-    const remove = this.db.prepare('DELETE FROM memories WHERE id=?'); for (const id of targets) remove.run(id);
-    for (const job of this.runningJobs()) if (job.status === 'running' && job.sourceIds.some(id => sourceIds.has(id))) this.updateJobInside(job.id, { status: 'interrupted', reason: '关联记忆已删除或更正', stage: '已撤回' });
+    const siblings=(sid:string) => { const match=/^(chat|episode|behavior):([^:]+)$/.exec(sid); return match?['chat:','episode:','behavior:'].map(prefix=>prefix+match[2]):[sid]; };
+    for (const sid of [...whole]) for (const sibling of siblings(sid)) whole.add(sibling);
+    // Mirror an exact quote into sibling event views, without inventing offsets.
+    for (const span of [...spans]) for (const sibling of siblings(span.sourceId)) {
+      if (sibling===span.sourceId) continue;
+      const source=this.sourceById(sibling); if (!source) continue;
+      let from=0,at:number; while ((at=source.text.indexOf(span.quote,from))>=0) { spans.push({sourceId:sibling,quote:span.quote,start:at,end:at+span.quote.length}); from=at+span.quote.length; }
+    }
+    let changed=true;
+    while (changed) {
+      changed=false;
+      for (const memory of memories) {
+        if (targets.has(memory.id)) continue;
+        const refs=[...(memory.evidence??[]),...(memory.counterEvidence??[])];
+        const overlap=refs.some(e=>spans.some(r=>e.sourceId===r.sourceId && e.start!==undefined && e.end!==undefined && r.start!==undefined && r.end!==undefined && e.start<r.end && r.start<e.end));
+        const legacyOverlap=memory.sourceIds.some(sid=>spans.some(r=>r.sourceId===sid) && !refs.some(e=>e.sourceId===sid));
+        const derived=(memory.parentMemoryIds??[]).some(id=>targets.has(id)) || this.db.prepare("SELECT to_id FROM memory_relations WHERE from_id=? AND kind='derived_from'").all(memory.id).some(row=>targets.has(String(row.to_id)));
+        if (memory.sourceIds.some(id=>whole.has(id)) || overlap || legacyOverlap || derived) {
+          targets.add(memory.id); changed=true;
+          if (legacyOverlap) for (const sid of memory.sourceIds) if (spans.some(r=>r.sourceId===sid)) for (const sibling of siblings(sid)) whole.add(sibling);
+        }
+      }
+    }
+    return {targets,whole,spans};
   }
-  deleteMemories(ids: string[]): void {
-    if (!Array.isArray(ids) || ids.length > 5000) throw new Error('删除范围无效');
-    this.transaction(() => { this.retractInside(ids); this.bump(); });
+  deletePreview(ids: string[]): DeletePreview {
+    if (!Array.isArray(ids) || ids.some(id=>typeof id!=='string'||!id||id.length>200)) throw new Error('删除范围无效');
+    const impact=this.deletionImpact(ids); const memories=[...impact.targets].map(id=>this.getMemory(id)!).filter(Boolean);
+    return {ids:ids.filter(id=>!!this.getMemory(id)),memories,sourceIds:[...new Set([...impact.whole,...impact.spans.map(s=>s.sourceId)])],revision:this.previewRevision()};
+  }
+  private retractInside(ids: string[], sourceIds = new Set<string>()): void {
+    const {targets,whole,spans}=this.deletionImpact(ids,sourceIds);
+    const add=this.db.prepare('INSERT OR IGNORE INTO source_redactions(source_id,start_offset,end_offset,quote) VALUES(?,?,?,?)');
+    for (const span of spans) if (span.start!==undefined && span.end!==undefined) add.run(span.sourceId,span.start,span.end,span.quote);
+    const revoke=this.db.prepare('UPDATE sources SET revoked=1 WHERE id=?'); for (const id of whole) revoke.run(id);
+    const remove=this.db.prepare('DELETE FROM memories WHERE id=?');
+    const links=this.db.prepare('DELETE FROM memory_links WHERE memory_id=?');
+    const vectors=this.db.prepare('DELETE FROM memory_vectors WHERE memory_id=?');
+    const history=this.db.prepare('DELETE FROM memory_history WHERE id=?');
+    for (const id of targets) { remove.run(id);links.run(id);vectors.run(id);history.run(id);if(this.ftsAvailable)this.db.prepare('DELETE FROM memory_fts WHERE id=?').run(id); }
+    const allRelations=dataFromRows<MemoryRelation>(this.db.prepare('SELECT data FROM memory_relations').all());
+    const affectedRelation=(r:MemoryRelation) => targets.has(r.fromId)||targets.has(r.toId)||r.evidence.some(e=>whole.has(e.sourceId)||spans.some(span=>span.sourceId===e.sourceId && span.start!==undefined && span.end!==undefined && e.start!==undefined && e.end!==undefined && e.start<span.end && span.start<e.end));
+    const removed=allRelations.filter(affectedRelation), kept=allRelations.filter(r=>!affectedRelation(r));
+    for(const relation of removed)this.db.prepare('DELETE FROM memory_relations WHERE id=?').run(relation.id);
+    // Removing the new claim or its contradiction also removes the reason the
+    // old claim was superseded/uncertain. Restore the last backed state only
+    // if no surviving relation still justifies that state.
+    for(const id of new Set(removed.flatMap(r=>r.kind==='updates'?[r.toId]:r.kind==='contradicts'?[r.fromId,r.toId]:[]))) {
+      if(targets.has(id))continue;
+      if(kept.some(r=>r.kind==='updates'&&r.toId===id || r.kind==='contradicts'&&(r.fromId===id||r.toId===id)))continue;
+      const memory=this.getMemory(id); const row=this.db.prepare('SELECT data FROM memory_history WHERE id=? ORDER BY version DESC LIMIT 1').get(id);
+      if(!memory||!row)continue;
+      const prior=parse<Memory>(row.data);this.archiveMemory(memory);
+      memory.status=prior.status??'active';memory.validTo=prior.validTo;memory.version=(memory.version??1)+1;memory.updatedAt=this.clock();
+      this.putMemory(memory);this.db.prepare('DELETE FROM memory_vectors WHERE memory_id=?').run(id);
+    }
+    const affected=new Set([...whole,...spans.map(s=>s.sourceId)]);
+    for (const job of this.runningJobs()) if (job.sourceIds.some(id=>affected.has(id))) this.updateJobInside(job.id,{status:'interrupted',reason:'关联记忆已删除或更正',stage:'已撤回'});
+    const companion=this.companion();
+    if (companion.moodEvidence?.sourceIds.some(id=>affected.has(id))) { companion.mood='平静'; delete companion.moodEvidence; this.setMeta('companion',companion); }
+  }
+  deleteMemories(ids: string[], expectedRevision?:number): void {
+    if (!Array.isArray(ids) || ids.some(id=>typeof id!=='string'||!id||id.length>200)) throw new Error('删除范围无效');
+    this.transaction(() => { if(expectedRevision!==undefined && expectedRevision!==this.previewRevision()) throw new Error('记忆已变化，请重新预览'); this.retractInside(ids); this.bump(); });
   }
   editMemory(id: string, text: string): Memory | null {
     const value = bounded(text, '记忆内容', 4000);
     return this.transaction(() => {
       const row = this.db.prepare('SELECT data FROM memories WHERE id=?').get(id); if (!row) return null;
       const old = parse<Memory>(row.data);
+      if(old.kind!=='user_fact') throw new Error('只能直接更正用户事实；其他记忆请删除后重新整理');
       this.retractInside([id]);
       const now = this.clock();
       const source: Source = { id: 'manual-correction:' + randomUUID(), kind: 'user_fact', text: value, occasion: 'manual-correction:' + randomUUID(), createdAt: now, processed: true, revoked: false };
       this.db.prepare('INSERT INTO sources(id,created_at,processed,revoked,data) VALUES(?,?,1,0,?)').run(source.id, now, JSON.stringify(source));
-      const memory: Memory = { id: randomUUID(), kind: 'user_fact', text: value, sourceIds: [source.id], createdAt: now, updatedAt: now };
-      this.db.prepare('INSERT INTO memories(id,updated_at,data) VALUES(?,?,?)').run(memory.id, now, JSON.stringify(memory)); this.bump(); return memory;
+      const memory: Memory = { id: randomUUID(), kind: old.kind, text: value, sourceIds: [source.id], createdAt: now, updatedAt: now, version:1, status:'uncertain', evidence:[{sourceId:source.id,quote:value,start:0,end:value.length}] };
+      this.putMemory(memory); this.bump(); return memory;
     });
+  }
+  linkMemories(input: Omit<MemoryRelation,'id'|'createdAt'>, expectedRevision?: number): MemoryRelation | null {
+    if (!input || input.fromId===input.toId || !['related','same_event','supports','contradicts','updates','derived_from'].includes(input.kind)) return null;
+    return this.transaction(() => {
+      if (expectedRevision!==undefined && expectedRevision!==this.revision()) return null;
+      const from=this.getMemory(input.fromId),to=this.getMemory(input.toId); if(!from||!to) return null;
+      const allowed=[...new Set([...from.sourceIds,...to.sourceIds])];
+      const evidence=this.validatedEvidence(input.evidence,allowed); if(!evidence) return null;
+      if (['updates','contradicts'].includes(input.kind) && !evidence.length) return null;
+      const old=this.db.prepare('SELECT data FROM memory_relations WHERE from_id=? AND to_id=? AND kind=?').get(input.fromId,input.toId,input.kind);
+      if(old)return parse<MemoryRelation>(old.data);
+      const relation: MemoryRelation={...input,evidence,id:randomUUID(),createdAt:this.clock()};
+      this.db.prepare('INSERT INTO memory_relations(id,from_id,to_id,kind,data) VALUES(?,?,?,?,?)').run(relation.id,relation.fromId,relation.toId,relation.kind,JSON.stringify(relation));
+      if(input.kind==='updates') {
+        this.archiveMemory(to); to.status='superseded'; to.validTo=from.validFrom??to.validTo??null; to.version=(to.version??1)+1;to.updatedAt=this.clock();this.putMemory(to);this.db.prepare('DELETE FROM memory_vectors WHERE memory_id=?').run(to.id);
+      }
+      if(input.kind==='contradicts') for(const memory of [from,to]) {this.archiveMemory(memory);memory.status='uncertain';memory.version=(memory.version??1)+1;memory.updatedAt=this.clock();this.putMemory(memory);this.db.prepare('DELETE FROM memory_vectors WHERE memory_id=?').run(memory.id);}
+      this.bumpPreview(); return relation;
+    });
+  }
+  private canEmbed(memory:Memory):boolean { return memory.sourceIds.every(id=>{const source=this.sourceById(id);return !!source && !source.revoked && (source.kind!=='observed_dialogue'||this.isEligible(source,this.settings()));}); }
+  pendingVectors(routeKey: string, limit=8, excludeIds:string[]=[]): Memory[] {
+    bounded(routeKey,'模型线路',2048); const n=Math.max(1,Math.min(100,Math.floor(limit))), excluded=new Set(excludeIds);
+    return dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories ORDER BY updated_at DESC').all()).filter(m=>!excluded.has(m.id) && m.status!=='superseded' && this.canEmbed(m) && !this.db.prepare('SELECT 1 FROM memory_vectors WHERE memory_id=? AND version=? AND route_key=?').get(m.id,m.version??1,routeKey)).slice(0,n);
+  }
+  saveVector(memoryId:string, version:number, routeKey:string, vector:number[], expectedRevision:number):boolean {
+    bounded(routeKey,'模型线路',2048);
+    if(!Array.isArray(vector)||!vector.length||vector.length>16384||vector.some(x=>typeof x!=='number'||!Number.isFinite(x))||!vector.some(x=>x!==0))return false;
+    return this.transaction(()=>{
+      if(expectedRevision!==this.revision())return false;
+      const memory=this.getMemory(memoryId);if(!memory||memory.status==='superseded'||!this.canEmbed(memory)||(memory.version??1)!==version)return false;
+      this.db.prepare('INSERT INTO memory_vectors(memory_id,version,route_key,data) VALUES(?,?,?,?) ON CONFLICT(memory_id,route_key) DO UPDATE SET version=excluded.version,data=excluded.data').run(memoryId,version,routeKey,JSON.stringify(vector));return true;
+    });
+  }
+  vectorCounts(routeKey:string):{indexed:number;total:number;pending:number} {
+    bounded(routeKey,'模型线路',2048);
+    const memories=dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories').all()).filter(m=>m.status!=='superseded'&&this.canEmbed(m));
+    const indexed=memories.filter(m=>!!this.db.prepare('SELECT 1 FROM memory_vectors WHERE memory_id=? AND version=? AND route_key=?').get(m.id,m.version??1,routeKey)).length;
+    return {indexed,total:memories.length,pending:memories.length-indexed};
+  }
+  recall(query:string,opts:{vector?:number[];routeKey?:string;limit?:number;maxChars?:number}={}):RecallResult {
+    if(typeof query!=='string'||query.length>20000)throw new Error('检索内容无效');
+    const limit=Math.max(1,Math.min(Number.MAX_SAFE_INTEGER,Math.floor(opts.limit??24))); const maxChars=Math.max(256,Math.min(Number.MAX_SAFE_INTEGER,Math.floor(opts.maxChars??20000)));
+    const all=dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories ORDER BY updated_at DESC').all());
+    const eligible=all.filter(m=>m.status!=='superseded'||isHistoricalQuery(query));const byId=new Map(eligible.map(m=>[m.id,m]));
+    const terms=searchTerms(query); const ranks=new Map<string,{score:number;reasons:Set<string>}>();
+    const add=(id:string,score:number,reason:string)=>{if(!byId.has(id))return;const row=ranks.get(id)??{score:0,reasons:new Set<string>()};row.score+=score;row.reasons.add(reason);ranks.set(id,row);};
+    if (terms.length && this.ftsAvailable) {
+      const fts=terms.map(term=>'"'+term.replace(/"/g,'""')+'"').join(' OR ');
+      try { this.db.prepare('SELECT id FROM memory_fts WHERE memory_fts MATCH ? ORDER BY bm25(memory_fts)').all(fts).forEach((row,i)=>add(String(row.id),1/(60+i+1),'关键词')); } catch { /* deterministic local fallback below */ }
+    }
+    if (terms.length && !ranks.size) {
+      const ranked=eligible.map(m=>{const content=new Set(searchTerms(m.text+' '+(m.topicKey??''),true));return {id:m.id,score:terms.reduce((n,t)=>n+(content.has(t)?(t.length>1?2:1):0),0)};}).filter(x=>x.score>0).sort((a,b)=>b.score-a.score);
+      ranked.forEach((row,i)=>add(row.id,1/(60+i+1),'本地关键词'));
+    }
+    let vectorCount=0;
+    if(opts.vector?.length && opts.routeKey) {
+      const vectors=this.db.prepare('SELECT memory_id,version,data FROM memory_vectors WHERE route_key=?').all(opts.routeKey).map(row=>({id:String(row.memory_id),version:Number(row.version),vector:parse<number[]>(row.data)}));
+      const ranked=vectors.flatMap(v=>{const m=byId.get(v.id);const score=m&&this.canEmbed(m)&&(m.version??1)===v.version?cosine(opts.vector!,v.vector):null;return score!==null&&score>0?[{id:v.id,score}]:[];}).sort((a,b)=>b.score-a.score);
+      vectorCount=ranked.length;ranked.forEach((row,i)=>add(row.id,1/(60+i+1),'语义'));
+    }
+    if(!terms.length) eligible.slice(0,Math.max(limit,30)).forEach((m,i)=>add(m.id,1/(60+i+1),'近期'));
+    for(const memory of eligible)if(memory.boundary)add(memory.id,0.01,'用户边界');
+    // Expand at most two relation hops; each later hop contributes less than its root.
+    let frontier=[...ranks.keys()].slice(0,100);const visited=new Set(frontier);
+    for(let hop=1;hop<=2 && frontier.length;hop++) {
+      const next:string[]=[];
+      for(const id of frontier) for(const row of this.db.prepare('SELECT from_id,to_id FROM memory_relations WHERE from_id=? OR to_id=?').all(id,id)) {
+        const other=String(row.from_id)===id?String(row.to_id):String(row.from_id);if(visited.has(other)||!byId.has(other))continue;
+        visited.add(other);next.push(other);add(other,0.006/hop,'关联 '+hop+' 跳');if(next.length>=200)break;
+      }
+      frontier=next.slice(0,200);
+    }
+    const hits:RecallHit[]=[...ranks.entries()].map(([id,r])=>{const memory=byId.get(id)!; const score=r.score*(memory.boundary?1:recencyWeight(memory.reinforcedAt??memory.updatedAt,this.clock()));return {memory,score,reasons:[...r.reasons]};}).sort((a,b)=>b.score-a.score||b.memory.updatedAt-a.memory.updatedAt);
+    let bytes=0;const selected:RecallHit[]=[];for(const hit of hits){const size=hit.memory.text.length;if(bytes+size>maxChars)continue;bytes+=size;selected.push(hit);if(selected.length>=limit)break;}
+    return {hits:selected,mode:vectorCount?'hybrid':'local',...(!vectorCount?{reason:opts.vector?.length?'当前线路没有可用的匹配向量':'本地关键词与关系检索'}:{})};
+  }
+  memoryPage(query:MemoryQuery={}, recall?:RecallResult):MemoryPage {
+    const offset=Math.max(0,Math.floor(query.offset??0)),limit=Math.max(1,Math.min(200,Math.floor(query.limit??50)));
+    const all=dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories ORDER BY updated_at DESC').all());
+    let list:Memory[];
+    if(query.query?.trim()) {
+      const terms=searchTerms(query.query), found=new Map((recall?.hits??[]).map(hit=>[hit.memory.id,hit.memory]));
+      for(const m of all) { const searchable=new Set(searchTerms(m.text+' '+(m.topicKey??''),true)); if(terms.some(t=>searchable.has(t)))found.set(m.id,m); }
+      list=[...found.values()];
+    } else list=all;
+    const state=(m:Memory)=>m.status==='superseded'?'superseded':m.status==='uncertain'||m.kind==='tendency'&&!m.evidence?.length?'uncertain':!m.boundary&&this.clock()-(m.reinforcedAt??m.updatedAt)>90*DAY_MS?'dormant':'active';
+    list=list.filter(m=>(!query.kind||m.kind===query.kind)&&(!query.state||state(m)===query.state)&&(!Number.isFinite(query.from)||m.createdAt>=query.from!)&&(!Number.isFinite(query.to)||m.createdAt<=query.to!)).map(m=>({...m,recallState:state(m)}));
+    return {items:list.slice(offset,offset+limit),total:list.length,offset,limit,mode:recall?.mode??'local',reason:recall?.reason};
+  }
+  memoryDetail(id:string):MemoryDetail|null {
+    const memory=this.getMemory(id);if(!memory)return null;
+    const relations=dataFromRows<MemoryRelation>(this.db.prepare('SELECT data FROM memory_relations WHERE from_id=? OR to_id=?').all(id,id));
+    const related=[...new Set(relations.map(r=>r.fromId===id?r.toId:r.fromId))].map(id=>this.getMemory(id)).filter((x):x is Memory=>!!x);
+    const sources=memory.sourceIds.map(id=>this.sourceById(id)).filter((x):x is Source=>!!x&&!x.revoked);
+    const history=dataFromRows<Memory>(this.db.prepare('SELECT data FROM memory_history WHERE id=? ORDER BY version DESC').all(id));
+    return {memory,sources,relations,related,history};
+  }
+  personalityProfile():PersonalityProfile {
+    const all=dataFromRows<Memory>(this.db.prepare('SELECT data FROM memories ORDER BY updated_at DESC').all());
+    return {initial:['温和','有主见'],tentative:all.filter(m=>m.kind==='understanding'||m.kind==='tendency'&&(m.status==='uncertain'||!m.evidence?.length)).map(m=>({...m,recallState:'uncertain'})),tendencies:all.filter(m=>m.kind==='tendency'&&(m.status??'active')==='active'&&!!m.evidence?.length)};
   }
   recordInteraction(type: 'pet' | 'feed', requestId: string): Interaction {
     if (type !== 'pet' && type !== 'feed') throw new Error('互动类型无效'); bounded(requestId, '互动 ID', 200);
@@ -273,7 +608,18 @@ export class Store {
     });
   }
   interactions(): Interaction[] { return dataFromRows<Interaction>(this.db.prepare('SELECT data FROM interactions WHERE created_at>=? ORDER BY created_at DESC,rowid DESC LIMIT 32').all(this.clock() - DAY_MS)); }
+  embeddingJobs(): Job[] { return dataFromRows<Job>(this.db.prepare("SELECT data FROM jobs WHERE json_extract(data,'$.kind')='embedding' ORDER BY created_at DESC").all()); }
   jobs(): Job[] { return dataFromRows<Job>(this.db.prepare('SELECT data FROM jobs ORDER BY created_at DESC LIMIT 500').all()); }
+  jobById(id:string):Job|undefined { const row=this.db.prepare('SELECT data FROM jobs WHERE id=?').get(id);return row?parse<Job>(row.data):undefined; }
+  hasSourceJob(kind:Job['kind'],sourceIds:string[],completedOnly=true):boolean {
+    if (!sourceIds.length) return false;
+    for(let i=0;i<sourceIds.length;i+=200){
+      const batch=sourceIds.slice(i,i+200), placeholders=batch.map(()=>'?').join(',');
+      const row=this.db.prepare(`SELECT 1 FROM jobs,json_each(jobs.data,'$.sourceIds') AS source WHERE json_extract(jobs.data,'$.kind')=? AND (?=0 OR json_extract(jobs.data,'$.status')<>'running') AND source.value IN (${placeholders}) LIMIT 1`).get(kind,completedOnly?1:0,...batch);
+      if(row)return true;
+    }
+    return false;
+  }
   private runningJobs(): Job[] { return dataFromRows<Job>(this.db.prepare("SELECT data FROM jobs WHERE json_extract(data,'$.status')='running'").all()); }
   putJob(job: Job): boolean {
     bounded(job.id, '任务 ID', 200);
@@ -285,7 +631,7 @@ export class Store {
     this.db.prepare('UPDATE jobs SET data=? WHERE id=?').run(JSON.stringify(next), id); return next;
   }
   updateJob(id: string, patch: Partial<Job>): Job | undefined { return this.transaction(() => { const next = this.updateJobInside(id, patch); return next; }); }
-  reserve(jobId: string, amount: number, background: boolean): string {
+  reserve(jobId: string, amount: number, background: boolean, details?: CostDetails): string {
     bounded(jobId, '任务 ID', 200);
     if (!numberAtLeastZero(amount)) throw new Error('预留费用无效');
     return this.transaction(() => {
@@ -293,31 +639,39 @@ export class Store {
       if (existing) return String(existing.id);
       if (background) {
         const settings = this.settings();
-        if (!settings.backgroundEnabled || !settings.prices || !sameRoute(settings.model, settings.priceRoute)) throw new Error('后台任务需要启用并为当前模型配置已核实单价');
-        if (amount === 0 && Math.max(settings.prices.input, settings.prices.cached, settings.prices.output) !== 0) throw new Error('非免费线路不能零费用预留');
+        if (!settings.backgroundEnabled) throw new Error('后台任务未启用');
+        if (details) {
+          if (!details.priceVerified || !details.provider || !details.model || !details.rawUnit || !Number.isFinite(details.conversionRate) || details.conversionRate<=0 || !numberAtLeastZero(details.rawReserved) || Math.abs(details.rawReserved*details.conversionRate-amount)>1e-8) throw new Error('Embedding 费用或换算尚未核实');
+        } else {
+          if (!settings.prices || !sameRoute(settings.model, settings.priceRoute)) throw new Error('后台任务需要启用并为当前模型配置已核实单价');
+          if (amount === 0 && Math.max(settings.prices.input, settings.prices.cached, settings.prices.output) !== 0) throw new Error('非免费线路不能零费用预留');
+        }
         const usage = this.usage();
         if (usage.uncertain) throw new Error('存在未核实费用，后台任务已暂停');
         if (usage.spent + usage.reserved + amount > settings.dailyLimit + 1e-9) throw new Error('今日后台预算不足');
       }
       const id = randomUUID();
-      this.db.prepare("INSERT INTO ledger(id,day,job_id,background,unit,reserved,actual,status,created_at) VALUES(?,?,?,?,?,?,NULL,'reserved',?)").run(id, beijingDay(this.clock()), jobId, background ? 1 : 0, this.settings().unit, amount, this.clock());
+      this.db.prepare("INSERT INTO ledger(id,day,job_id,background,unit,reserved,actual,status,created_at,details) VALUES(?,?,?,?,?,?,NULL,'reserved',?,?)").run(id, beijingDay(this.clock()), jobId, background ? 1 : 0, this.settings().unit, amount, this.clock(),details?JSON.stringify(details):null);
       return id;
     });
   }
-  settle(ticket: string, actual: number | null): void {
+  settle(ticket: string, actual: number | null, details?: Partial<CostDetails>): void {
     if (actual !== null && !numberAtLeastZero(actual)) throw new Error('实际费用无效');
     this.transaction(() => {
-      const row = this.db.prepare('SELECT status,actual,reserved,background FROM ledger WHERE id=?').get(ticket); if (!row) throw new Error('费用记录不存在');
+      const row = this.db.prepare('SELECT status,actual,reserved,background,details FROM ledger WHERE id=?').get(ticket); if (!row) throw new Error('费用记录不存在');
       if (row.status !== 'reserved') {
         if (row.status === 'settled' && actual !== null && Number(row.actual) === actual || row.status === 'uncertain' && (actual === null && row.actual === null || actual !== null && row.actual !== null && Number(row.actual) === actual)) return;
         throw new Error('费用记录已结算，不能重复修改');
       }
       const uncertain = actual === null || (!!row.background && actual > Number(row.reserved) + 1e-9);
-      this.db.prepare('UPDATE ledger SET status=?,actual=? WHERE id=?').run(uncertain ? 'uncertain' : 'settled', actual, ticket);
+      const merged=details?{...(row.details?parse<CostDetails>(row.details):{}),...details}:row.details?parse<CostDetails>(row.details):null;
+      if (row.details && actual!==null && (!merged || !numberAtLeastZero(merged.rawActual) || Math.abs(merged.rawActual*Number(merged.conversionRate)-actual)>1e-8)) throw new Error('实际费用与换算不一致');
+      if (merged && [merged.inputTokens,merged.outputTokens,merged.cachedTokens].some(n=>n!==undefined && (!Number.isSafeInteger(n)||n<0))) throw new Error('模型用量无效');
+      this.db.prepare('UPDATE ledger SET status=?,actual=?,details=? WHERE id=?').run(uncertain ? 'uncertain' : 'settled', actual, merged?JSON.stringify(merged):null, ticket);
     });
   }
   ledger(): Ledger[] {
-    return this.db.prepare('SELECT * FROM ledger ORDER BY created_at DESC LIMIT 500').all().map(row => ({ unit:String(row.unit), id: String(row.id), day: String(row.day), jobId: String(row.job_id), background: !!row.background, reserved: Number(row.reserved), actual: row.actual === null ? null : Number(row.actual), status: row.status as Ledger['status'], createdAt: Number(row.created_at) }));
+    return this.db.prepare('SELECT * FROM ledger ORDER BY created_at DESC LIMIT 500').all().map(row => ({ unit:String(row.unit), id: String(row.id), day: String(row.day), jobId: String(row.job_id), background: !!row.background, reserved: Number(row.reserved), actual: row.actual === null ? null : Number(row.actual), status: row.status as Ledger['status'], createdAt: Number(row.created_at), ...(row.details?{details:parse<CostDetails>(row.details)}:{}) }));
   }
   usage(): Usage {
     const day = beijingDay(this.clock());

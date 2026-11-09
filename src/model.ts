@@ -50,7 +50,7 @@ export class Model {
     if (input.background && !priced) throw new ModelFailure('PRICE', '当前模型缺少已确认的计费信息，后台任务已暂停');
     const reserveAmount = priced ? (bound*Math.max(prices.input,prices.cached)+input.maxTokens*prices.output)/1e6 : 0;
     let ticket: string;
-    try { ticket = this.store.reserve(input.jobId,reserveAmount,input.background); } catch (e) { throw new ModelFailure('BUDGET', e instanceof Error ? e.message : '后台预算暂不可用'); }
+    try { ticket = this.store.reserve(input.jobId,reserveAmount,input.background,priced?{provider:route.provider,model:route.model,rawUnit:this.store.settings().unit,conversionRate:1,priceVerified:true,rawReserved:reserveAmount}:undefined); } catch (e) { throw new ModelFailure('BUDGET', e instanceof Error ? e.message : '后台预算暂不可用'); }
     let text='', usage:any, finish:any, closed=false, dispatched=false, caught:unknown;
     try {
       input.signal.throwIfAborted();
@@ -73,7 +73,7 @@ export class Model {
     const valid=nums?.every((v:any)=>Number.isSafeInteger(v)&&v>=0);
     // DSH normalizes inputTokens to uncached input; cache read/write are separate fields.
     const actual=!dispatched ? 0 : priced&&valid&&closed&&finish ? ((nums[0]+nums[3])*prices.input+nums[2]*prices.cached+nums[1]*prices.output)/1e6 : null;
-    this.store.settle(ticket,actual);
+    this.store.settle(ticket,actual,{rawActual:actual,...valid?{inputTokens:nums[0]+nums[3],outputTokens:nums[1],cachedTokens:nums[2]}:{}});
     if(caught) throw caught;
     return text;
   }

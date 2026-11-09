@@ -73,7 +73,7 @@ test('evidence gate uses distinct occasions and Beijing dates; one sentence is n
     assert.equal(e.store.saveMemory({ kind: 'tendency', text: '愿意认真讨论', sourceIds: ['a', 'b', 'c'] }), null);
     e.advance(24 * 3600 * 1000);
     e.store.addSource(source('d', e.clock(), { kind: 'shared_episode', occasion: 'fourth' }));
-    assert.ok(e.store.saveMemory({ kind: 'tendency', text: '愿意认真讨论', sourceIds: ['a', 'b', 'd'] }));
+    assert.ok(e.store.saveMemory({ kind: 'tendency', text: '愿意认真讨论', sourceIds: ['a', 'b', 'd'], evidence: ['a','b','d'].map(id=>({sourceId:id,quote:'用户提供的内容 '+id})) }));
     assert.equal(beijingDay(Date.parse('2026-11-08T15:59:00Z')), '2026-11-08');
     assert.equal(beijingDay(Date.parse('2026-11-08T16:00:00Z')), '2026-11-09');
     assert.equal(e.store.saveMemory({ kind: 'user_fact', text: '不可冒充用户事实', sourceIds: ['a'] }), null);

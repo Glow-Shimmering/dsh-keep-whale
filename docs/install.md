@@ -52,3 +52,21 @@ node scripts/restore.mjs \
 ```
 
 恢复前会核对安装后的包配置、pnpm 锁文件和链接。若它们在安装后被修改，脚本会拒绝自动覆盖，需人工合并。恢复只撤销本次安装对 profile 的修改，不覆盖或删除新插件数据、旧数据库或旧账户资料；备份仍保留。
+
+## 记忆网络升级与回退
+
+0.2 版在现有数据上迁移，不重置身份或聊天，不再运行首次安装器。升级前可用以下工具做一致性备份（备份目录必须不存在或为空）：
+
+```sh
+node scripts/backup-memory.mjs --data-home "$HOME/.dsh" --backup-dir "$HOME/dsh-backups/keep-whale-before-memory-network"
+```
+
+在已链接的源码目录构建新版本；确认 DSH 任务结束和草稿已保存，再退出并重开 DSH。首次加载 schema v2 时还会在数据目录生成 `keep-whale.before-memory-network-*.sqlite`。不要将这些文件上传公开仓库。
+
+如需回退，先完整退出 DSH，包括后台进程：
+
+```sh
+node scripts/rollback-memory.mjs --data-home "$HOME/.dsh" --backup-dir "$HOME/dsh-backups/keep-whale-before-memory-network" --confirm-stopped
+```
+
+工具验证备份，并额外保存回退前数据库及 dist；恢复指定数据库和运行 bundle，不删除媒体、源码、密钥或其他插件。当前新产生的数据仍保留在回退前归档中，但恢复后的旧版仅显示备份时的数据。回退的 bundle 会在下一次源码构建时被覆盖；重新升级前先确认要使用哪一份数据库，不能把旧、新数据文件直接拼接。
