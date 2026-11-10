@@ -126,6 +126,33 @@ test('model handles known-free route, missing usage, and truncated output with c
   try { await assert.rejects(truncated.call('truncated'), (e: unknown) => e instanceof ModelFailure && e.code === 'TRUNCATED'); assert.ok(truncated.store.usage().spent > 0); assert.equal(truncated.store.usage().uncertain, false); } finally { truncated.cleanup(); }
 });
 
+test('model safely classifies terminal adapter failures and treats zero failure usage as unknown', async () => {
+  const zero = { type: 'usage', usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+  const failure = (code: string) => ({ type: 'finish', reason: { kind: 'error', failure: { code, message: 'private-token-and-url' } } });
+  const e = modelFixture([zero, failure('RATE_LIMIT')]);
+  try {
+    await assert.rejects(e.call('rate', { budgetScope:'bilibili' }), (error: unknown) => error instanceof ModelFailure && error.code === 'MODEL_RATE_LIMIT' && !error.message.includes('private-token-and-url'));
+    assert.equal(e.store.ledger()[0].actual, null);
+    assert.equal(e.store.usage(true).uncertain, true);
+  } finally { e.cleanup(); }
+  const known = modelFixture([usage, failure('INVALID_CREDENTIAL')]);
+  try {
+    await assert.rejects(known.call('known'), (error: unknown) => error instanceof ModelFailure && error.code === 'MODEL_AUTH' && !error.message.includes('private-token-and-url'));
+    assert.ok(known.store.ledger()[0].actual! > 0);
+    assert.equal(known.store.usage().uncertain, false);
+  } finally { known.cleanup(); }
+  const unknown = modelFixture([usage, failure('secret-unknown-code')]);
+  try {
+    await assert.rejects(unknown.call('unknown'), (error: unknown) => error instanceof ModelFailure && error.code === 'MODEL' && !error.message.includes('secret-unknown-code') && !error.message.includes('private-token-and-url'));
+  } finally { unknown.cleanup(); }
+  const cancelled = modelFixture([zero, finish('aborted')]);
+  try {
+    await assert.rejects(cancelled.call('cancelled', { budgetScope:'bilibili' }), (error: unknown) => error instanceof ModelFailure && error.code === 'CANCELLED');
+    assert.equal(cancelled.store.ledger()[0].actual, null);
+    assert.equal(cancelled.store.usage(true).uncertain, true);
+  } finally { cancelled.cleanup(); }
+});
+
 test('model does not dispatch on pre-abort and accounts for abort during stream', async () => {
   const before = modelFixture([text, usage, finish('stop')]);
   try {

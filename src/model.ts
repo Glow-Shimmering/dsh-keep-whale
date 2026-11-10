@@ -8,6 +8,19 @@ export class ModelFailure extends Error {
 }
 export const userError = (error: unknown) => error instanceof ModelFailure ? error.message : (error instanceof Error && error.name === 'AbortError') ? '本次任务已中断' : '任务未完成，请检查模型连接或配置后重试';
 
+// Provider messages may contain request details or credentials. Only expose
+// known, provider-neutral codes and keep unknown errors deliberately generic.
+function streamFailure(code:unknown):ModelFailure {
+  switch(code) {
+    case 'AUTH': case 'INVALID_CREDENTIAL': case 'MISSING_CREDENTIAL': return new ModelFailure('MODEL_AUTH','模型线路认证失败，请检查对应凭据');
+    case 'QUOTA': case 'ACCOUNT_QUOTA': return new ModelFailure('MODEL_QUOTA','模型线路额度或余额不足，请检查服务商账户');
+    case 'RATE_LIMIT': return new ModelFailure('MODEL_RATE_LIMIT','模型线路请求频率受限，请稍后重试');
+    case 'CONTEXT_WINDOW_EXCEEDED': return new ModelFailure('CONTEXT','内容超出模型上下文容量，请缩短后重试');
+    case 'EMPTY_RESPONSE': return new ModelFailure('MODEL_EMPTY','模型未返回正文，请稍后重试');
+    default: return new ModelFailure('MODEL','模型线路返回错误，请检查连接和服务状态');
+  }
+}
+
 export function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if(signal.aborted){void promise.catch(()=>{});return Promise.reject(signal.reason);}
   return new Promise<T>((resolve,reject)=>{
@@ -52,7 +65,7 @@ export class Model {
     const reserveAmount = priced ? (bound*Math.max(prices.input,prices.cached)+input.maxTokens*prices.output)/1e6 : 0;
     let ticket: string;
     try { ticket = this.store.reserve(input.jobId,reserveAmount,input.background,priced?{provider:route.provider,model:route.model,rawUnit:this.store.settings().unit,conversionRate:1,priceVerified:true,rawReserved:reserveAmount}:undefined,input.budgetScope); } catch (e) { throw new ModelFailure('BUDGET', e instanceof Error ? e.message : '后台预算暂不可用'); }
-    let text='', usage:any, finish:any, closed=false, dispatched=false, caught:unknown;
+    let text='', usage:any, finish:any, failureCode:unknown, closed=false, dispatched=false, caught:unknown;
     try {
       input.signal.throwIfAborted();
       const options:any = { ...route, system:input.system, messages:input.messages, maxTokens:input.maxTokens, signal:input.signal };
@@ -63,17 +76,24 @@ export class Model {
         const next:any=await abortable(iterator.next(),input.signal);if(next.done){closed=true;break;}const part=next.value;
         if(part.type==='text-delta') { text+=part.text; input.onText?.(text); if(text.length>150000) throw new ModelFailure('OUTPUT','输出异常过长，已停止本次任务'); }
         if(part.type==='usage') usage=part.usage;
-        if(part.type==='finish') finish=typeof part.reason==='string'?part.reason:{...part.reason}.kind;
+        if(part.type==='finish') {
+          finish=typeof part.reason==='string'?part.reason:part.reason?.kind;
+          failureCode=typeof part.reason==='object'&&part.reason!==null?part.reason.failure?.code:undefined;
+        }
       }
       } finally { if(iterator.return)void Promise.resolve(iterator.return()).catch(()=>{}); }
       if(input.signal.aborted || finish==='aborted') throw new ModelFailure('CANCELLED','本次任务已中断');
       if(finish==='max-tokens') throw new ModelFailure('TRUNCATED','这次回复达到输出长度上限，内容尚未完成；可以重试');
+      if(finish==='error') throw streamFailure(failureCode);
       if(finish!=='stop' || !text.trim()) throw new ModelFailure('MODEL','模型未完整返回内容，请检查连接后重试');
     } catch(e) { caught=e; }
     const nums=usage&&[usage.inputTokens,usage.outputTokens,usage.cacheReadTokens??0,usage.cacheWriteTokens??0];
     const valid=nums?.every((v:any)=>Number.isSafeInteger(v)&&v>=0);
     // DSH normalizes inputTokens to uncached input; cache read/write are separate fields.
-    const actual=!dispatched ? 0 : priced&&valid&&closed&&finish ? ((nums[0]+nums[3])*prices.input+nums[2]*prices.cached+nums[1]*prices.output)/1e6 : null;
+    // A failed stream can carry placeholder zero counts rather than a provider
+    // settlement. They do not prove the failed request was free.
+    const verifiedUsage=valid&&!(['error','aborted'].includes(finish)&&nums.every((n:number)=>n===0));
+    const actual=!dispatched ? 0 : priced&&verifiedUsage&&closed&&finish ? ((nums[0]+nums[3])*prices.input+nums[2]*prices.cached+nums[1]*prices.output)/1e6 : null;
     this.store.settle(ticket,actual,{rawActual:actual,...valid?{inputTokens:nums[0]+nums[3],outputTokens:nums[1],cachedTokens:nums[2]}:{}});
     if(caught) throw caught;
     return text;
