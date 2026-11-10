@@ -5,7 +5,7 @@ const MOODS: Readonly<Record<string,string>> = {
   沮丧: 'sad', 不满: 'annoyed', 害羞: 'shy', 释然: 'relieved',
 };
 export type { InteractionAnimation };
-export type Appearance = {available:boolean;version:string|null;durations?:AppearanceDurations};
+export type Appearance = {available:boolean;version:string|null;durations?:AppearanceDurations;moodInteractions?:boolean};
 export type Position = {x:number; y:number};
 /** Older snapshots and unbound skins retain the original playback timing. */
 export function interactionDuration(type:InteractionAnimation,appearance?:Appearance|null):number {
@@ -18,8 +18,8 @@ export function moodPortrait(mood?: string | null, customSkin?: string | null, a
   return `/keep-whale/art/${MOODS[mood || ''] || 'calm'}.png?${versionQuery(appearance)}`;
 }
 export function interactionPortrait(mood: string | null | undefined, customSkin: string | null | undefined, appearance: Appearance | null | undefined, interaction: InteractionAnimation | null, reducedMotion: boolean, visible: boolean, playbackId: string): string {
-  if (!interaction || !appearance?.available) return moodPortrait(mood,customSkin,appearance);
-  const base=`/keep-whale/art/${interaction}`;
+  if (!interaction || !appearance?.available || !appearance.moodInteractions) return moodPortrait(mood,customSkin,appearance);
+  const base=`/keep-whale/art/${interaction}-${MOODS[mood || ''] || 'calm'}`;
   // A unique URL restarts the animation even when the browser shares GIF timers.
   return reducedMotion || !visible ? `${base}.png?${versionQuery(appearance)}` : `${base}.gif?${versionQuery(appearance)}&play=${encodeURIComponent(playbackId)}`;
 }

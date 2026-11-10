@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, unlinkSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { Appearance, APPEARANCE_FILES } from '../src/appearance.js';
+import { Appearance, APPEARANCE_FILES, MOOD_APPEARANCE_FILES } from '../src/appearance.js';
 import { createHandler } from '../src/server.js';
 const png=Buffer.from([137,80,78,71,13,10,26,10,0,1]);
 const gif=Buffer.from('GIF89aSynthetic','ascii');
@@ -91,4 +91,40 @@ test('art HTTP route is private, whitelisted, origin-checked and stops immediate
   skin=null;assert.equal((await request(handler,'GET','/keep-whale/art/pet.gif')).status,404);
   const state=await request(handler,'GET','/keep-whale/state');assert.deepEqual(JSON.parse(state.data.toString()).appearance,{available:false,version:null});assert(!state.data.toString().includes(f.root));
  }finally{f.close();}
+});
+
+
+test('v2 exposes only complete per-mood media for the exact bound skin',async()=>{
+ const f=fixture();try {
+  f.manifest.schemaVersion=2;f.manifest.version='mood-v2';f.manifest.durations={pet:1800,feed:2200};
+  f.manifest.files=Object.fromEntries(MOOD_APPEARANCE_FILES.map(name=>[name,name]));
+  for(const file of MOOD_APPEARANCE_FILES)writeFileSync(join(f.dir,file),file.endsWith('.png')?png:gif);f.save();
+  assert.equal(MOOD_APPEARANCE_FILES.length,40);
+  assert.deepEqual(f.appearance.status(sourceSkin),{available:true,version:'mood-v2',durations:{pet:1800,feed:2200},moodInteractions:true});
+  for(const mood of ['calm','happy','expectant','worried','sad','annoyed','shy','relieved'])for(const action of ['pet','feed']) {
+   assert.deepEqual(f.appearance.bytes(`${action}-${mood}.gif`,sourceSkin),{bytes:gif,mediaType:'image/gif'});
+   assert.deepEqual(f.appearance.bytes(`${action}-${mood}.png`,sourceSkin),{bytes:png,mediaType:'image/png'});
+  }
+  assert.equal(f.appearance.bytes('pet.gif',sourceSkin),null,'v1 leftover must not leak into v2');
+  assert.equal(f.appearance.bytes('pet-worried.gif',null),null);
+  const handler=createHandler({appearance:f.appearance,store:{settings:()=>({skin:sourceSkin})}} as any,new URL('../public/whale-girl.png',import.meta.url));
+  assert.equal((await request(handler,'GET','/keep-whale/art/pet-sad.gif?play=1')).status,200);
+  for(const path of ['/keep-whale/art/pet-happy/../../manifest.json','/keep-whale/art/pet-nefarious.gif','/keep-whale/art/pet.gif'])assert.equal((await request(handler,'GET',path)).status,404);
+  unlinkSync(join(f.dir,'pet-sad.gif'));symlinkSync('/etc/passwd',join(f.dir,'pet-sad.gif'));
+  assert.equal(f.appearance.status(sourceSkin).available,false);assert.equal(f.appearance.bytes('sad.png',sourceSkin),null);
+ }finally{f.close();}
+});
+
+test('v2 rejects missing, extra, substituted and corrupt mood interaction assets',()=>{
+ for(const mutate of [
+  (f:ReturnType<typeof fixture>)=>{delete f.manifest.files['feed-sad.gif'];f.save();},
+  (f:ReturnType<typeof fixture>)=>{f.manifest.files['feed-sad.gif']='../manifest.json';f.save();},
+  (f:ReturnType<typeof fixture>)=>{f.manifest.files['feed-invalid.gif']='feed-invalid.gif';f.save();},
+  (f:ReturnType<typeof fixture>)=>unlinkSync(join(f.dir,'feed-shy.gif')),
+  (f:ReturnType<typeof fixture>)=>writeFileSync(join(f.dir,'pet-sad.gif'),png),
+ ]) {const f=fixture();try{
+  f.manifest.schemaVersion=2;f.manifest.files=Object.fromEntries(MOOD_APPEARANCE_FILES.map(name=>[name,name]));
+  for(const file of MOOD_APPEARANCE_FILES)writeFileSync(join(f.dir,file),file.endsWith('.png')?png:gif);f.save();
+  mutate(f);assert.deepEqual(f.appearance.status(sourceSkin),{available:false,version:null});assert.equal(f.appearance.bytes('happy.png',sourceSkin),null);
+ }finally{f.close();}}
 });

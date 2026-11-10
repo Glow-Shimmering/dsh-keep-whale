@@ -1,12 +1,12 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { validInteractionDuration, type AppearanceDurations } from './appearance-timing.js';
+import { MOOD_NAMES, validInteractionDuration, type AppearanceDurations } from './appearance-timing.js';
 
 /** Private appearance packs are local to one exact skin, never public assets. */
 export const APPEARANCE_FILES = ['calm.png','happy.png','expectant.png','worried.png','sad.png','annoyed.png','shy.png','relieved.png','pet.png','feed.png','pet.gif','feed.gif'] as const;
-type ArtName = typeof APPEARANCE_FILES[number];
-export type AppearanceStatus = { available: boolean; version: string | null; durations?: AppearanceDurations };
-const allowed = new Set<string>(APPEARANCE_FILES);
+export const MOOD_APPEARANCE_FILES = [...MOOD_NAMES.map(mood=>`${mood}.png`),...MOOD_NAMES.flatMap(mood=>['pet','feed'].flatMap(action=>[`${action}-${mood}.png`,`${action}-${mood}.gif`]))];
+export type AppearanceStatus = { available: boolean; version: string | null; durations?: AppearanceDurations; moodInteractions?: boolean };
+const allowed = new Set<string>([...APPEARANCE_FILES,...MOOD_APPEARANCE_FILES]);
 const unavailable: AppearanceStatus = { available:false, version:null };
 const limit = 8 * 1024 * 1024;
 const pngSignature = Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]);
@@ -37,28 +37,30 @@ export class Appearance {
     const info=lstatSync(this.dir);
     if(!info.isDirectory() || info.isSymbolicLink() || realpathSync(this.dir)!==join(realpathSync(this.root),'appearance'))throw new Error('invalid directory');
   }
-  private validate(skin:string|null):{version:string;durations:AppearanceDurations} {
+  private validate(skin:string|null):{version:string;durations:AppearanceDurations;files:readonly string[];moodInteractions:boolean} {
     this.directory();
     const manifest=JSON.parse(readFile(join(this.dir,'manifest.json'),64*1024).toString('utf8'));
-    if(!manifest || typeof manifest!=='object' || Array.isArray(manifest) || manifest.schemaVersion!==1 || typeof manifest.version!=='string' || !/^[A-Za-z0-9._-]{1,128}$/.test(manifest.version))throw new Error('invalid manifest');
+    if(!manifest || typeof manifest!=='object' || Array.isArray(manifest) || ![1,2].includes(manifest.schemaVersion) || typeof manifest.version!=='string' || !/^[A-Za-z0-9._-]{1,128}$/.test(manifest.version))throw new Error('invalid manifest');
     if(manifest.sourceSkin!==null && (typeof manifest.sourceSkin!=='string' || !/^\/keep-whale\/media\/[0-9a-f-]{36}$/.test(manifest.sourceSkin)))throw new Error('invalid skin');
     if(manifest.sourceSkin!==skin || !manifest.files || typeof manifest.files!=='object' || Array.isArray(manifest.files))throw new Error('wrong skin');
     const keys=Object.keys(manifest.files);
-    if(keys.length!==APPEARANCE_FILES.length || keys.some(key=>!allowed.has(key)) || APPEARANCE_FILES.some(name=>manifest.files[name]!==name))throw new Error('invalid files');
+    const files:readonly string[]=manifest.schemaVersion===2?MOOD_APPEARANCE_FILES:APPEARANCE_FILES;
+    if(keys.length!==files.length || keys.some(key=>!files.includes(key)) || files.some(name=>manifest.files[name]!==name))throw new Error('invalid files');
     if(!validInteractionDuration(manifest.durations?.pet) || !validInteractionDuration(manifest.durations?.feed))throw new Error('invalid durations');
-    for(const name of APPEARANCE_FILES) if(!validSignature(name,readFile(join(this.dir,name),limit,true)))throw new Error('invalid image');
+    for(const name of files) if(!validSignature(name,readFile(join(this.dir,name),limit,true)))throw new Error('invalid image');
     this.directory();
-    return {version:manifest.version,durations:{pet:manifest.durations.pet,feed:manifest.durations.feed}};
+    return {version:manifest.version,durations:{pet:manifest.durations.pet,feed:manifest.durations.feed},files,moodInteractions:manifest.schemaVersion===2};
   }
   status(skin:string|null):AppearanceStatus {
-    try { const {version,durations}=this.validate(skin);return {available:true,version,durations}; }
+    try { const {version,durations,moodInteractions}=this.validate(skin);return {available:true,version,durations,...(moodInteractions?{moodInteractions:true}:{})}; }
     catch { return {...unavailable}; }
   }
   bytes(name:string,skin:string|null):{bytes:Buffer;mediaType:'image/png'|'image/gif'}|null {
     if(!allowed.has(name))return null;
     try {
-      this.validate(skin);
-      const bytes=readFile(join(this.dir,name as ArtName),limit);
+      const {files}=this.validate(skin);
+      if(!files.includes(name))return null;
+      const bytes=readFile(join(this.dir,name),limit);
       if(!validSignature(name,bytes))return null;
       this.directory();
       return {bytes,mediaType:name.endsWith('.png')?'image/png':'image/gif'};

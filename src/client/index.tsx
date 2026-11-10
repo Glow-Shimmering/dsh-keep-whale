@@ -159,6 +159,12 @@ window.__ModuleLoader__.load({
       if(!image.dataset.fallback && skin) {image.dataset.fallback='1';image.src=skin;}
       else if(image.dataset.fallback!=='2'){image.dataset.fallback='2';image.src=`${PREFIX}/portrait.png`;}
     }
+    function fallbackInteraction(event:React.SyntheticEvent<HTMLImageElement>,mood:string,skin:string|null|undefined,appearance:Snapshot['appearance']) {
+      const image=event.currentTarget;
+      if(!image.dataset.fallback && appearance?.available) {image.dataset.fallback='mood';image.src=moodPortrait(mood,skin,appearance);}
+      else if(!image.dataset.fallback || image.dataset.fallback==='mood') {image.dataset.fallback=skin?'skin':'default';image.src=skin||`${PREFIX}/portrait.png`;}
+      else if(image.dataset.fallback==='skin') {image.dataset.fallback='default';image.src=`${PREFIX}/portrait.png`;}
+    }
     function downloadJSON(value: unknown) {
       const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], {type:'application/json'}));
       const link = document.createElement('a'); link.href = url; link.download = 'keep-whale-memories.json'; link.click();
@@ -403,6 +409,7 @@ window.__ModuleLoader__.load({
     function AppearancePreview({data}: {data:Snapshot}) {
       const [open,setOpen]=useState(false);
       const [preview,setPreview]=useState<'pet'|'feed'|null>(null);
+      const [chosenMood,setChosenMood]=useState<string|null>(null),[lockedMood,setLockedMood]=useState<string|null>(null);
       const [playbackId,setPlaybackId]=useState('');
       const timer=useRef<ReturnType<typeof setTimeout>|null>(null);
       const {reduced,visible}=useMotionPreferences();
@@ -411,17 +418,19 @@ window.__ModuleLoader__.load({
       useEffect(()=>{if(!visible)stop();},[visible]);
       const play=(type:'pet'|'feed')=>{
         if(timer.current)clearTimeout(timer.current);
-        setPlaybackId(createId());setPreview(type);
+        setLockedMood(chosenMood||data.companion.mood);setPlaybackId(createId());setPreview(type);
         timer.current=setTimeout(()=>{timer.current=null;setPreview(null);},interactionDuration(type,data.appearance));
       };
       const moods=['平静','开心','期待','担心','沮丧','不满','害羞','释然'];
-      const src=interactionPortrait(data.companion.mood,data.settings.skin,data.appearance,preview,reduced,visible,playbackId);
+      const mood=preview&&lockedMood?lockedMood:chosenMood||data.companion.mood;
+      const src=interactionPortrait(mood,data.settings.skin,data.appearance,preview,reduced,visible,playbackId);
       return <details className="kw-appearance-preview" onToggle={event=>{const next=event.currentTarget.open;setOpen(next);if(!next)stop();}}>
         <summary>预览表情与动作</summary>
         {open&&<div className="kw-stack">
           <small>仅预览画面，不记录互动，也不会改变心情。</small>
           <div className="kw-mood-grid">{moods.map(mood=><figure key={mood}><img src={moodPortrait(mood,data.settings.skin,data.appearance)} onError={event=>fallbackPortrait(event,data.settings.skin)} alt=""/><figcaption>{mood}</figcaption></figure>)}</div>
-          <div className="kw-preview-action"><img key={src} src={src} onError={event=>fallbackPortrait(event,data.settings.skin)} alt={preview==='pet'?'摸摸动作预览':preview==='feed'?'喂食动作预览':'当前心情预览'}/><div className="kw-row"><button type="button" onClick={()=>play('pet')}>预览摸摸</button><button type="button" onClick={()=>play('feed')}>预览喂食</button></div></div>
+          <label>预览心情<select aria-label="预览心情" value={chosenMood||data.companion.mood} onChange={event=>{stop();setChosenMood(event.currentTarget.value);}}>{moods.map(mood=><option key={mood} value={mood}>{mood}</option>)}</select></label>
+          <div className="kw-preview-action"><img key={src} src={src} onError={event=>fallbackInteraction(event,mood,data.settings.skin,data.appearance)} alt={preview==='pet'?'摸摸动作预览':preview==='feed'?'喂食动作预览':'当前心情预览'}/><div className="kw-row"><button type="button" onClick={()=>play('pet')}>预览摸摸</button><button type="button" onClick={()=>play('feed')}>预览喂食</button></div></div>
         </div>}
       </details>;
     }
@@ -527,6 +536,7 @@ window.__ModuleLoader__.load({
       const [collapsed,setCollapsed]=useState(()=>read(KEY_COLLAPSED,false));
       const [menu,setMenu]=useState(false), [bubble,setBubble]=useState('');
       const [anim,setAnim]=useState<'pet'|'feed'|null>(null), [interacting,setInteracting]=useState(false);
+      const [lockedMood,setLockedMood]=useState<string|null>(null);
       const [playbackId,setPlaybackId]=useState('');const {reduced,visible}=useMotionPreferences();
       const actionPending=useRef(false), animationTimer=useRef<ReturnType<typeof setTimeout>|null>(null), mounted=useRef(true);
       const drag=useRef<{x:number;y:number;origin:Pos;moved:boolean;pointerId:number}|null>(null);
@@ -548,7 +558,7 @@ window.__ModuleLoader__.load({
       const showPanel=(tab:Tab)=>{setMenu(false);setBubble(openPanel(ctx,tab)?'':'伙伴面板暂时无法打开，请从侧边栏「陪伴伙伴」进入。');};
       const interact=async(type:'pet'|'feed')=>{
         if(actionPending.current||animationTimer.current)return;
-        actionPending.current=true;setInteracting(true);setMenu(false);setBubble('');setPlaybackId(createId());setAnim(type);
+        actionPending.current=true;setInteracting(true);setMenu(false);setBubble('');setLockedMood(data?.companion.mood||'平静');setPlaybackId(createId());setAnim(type);
         if(dismiss.current)clearTimeout(dismiss.current);
         // Start on the click, not after the next state poll. No model is involved.
         animationTimer.current=setTimeout(()=>{animationTimer.current=null;if(mounted.current)setAnim(null);},interactionDuration(type,data?.appearance));
@@ -572,18 +582,18 @@ window.__ModuleLoader__.load({
       const name=data?.companion.name||'伙伴';
       const state=offline?'离线':data?.settings.quiet?'安静陪伴':mood;
       const artwork=data?.appearance;
-      const portrait=interactionPortrait(mood,skin,artwork,collapsed?null:anim,reduced,visible,playbackId);
-      const fallback=moodPortrait(mood,skin);
+      const displayMood=anim&&lockedMood?lockedMood:mood;
+      const portrait=interactionPortrait(displayMood,skin,artwork,collapsed?null:anim,reduced,visible,playbackId);
       const description=`${name} · ${state}${data?.unread?` · ${data.unread} 条未读消息`:''}`;
       return <div className={`kw-root kw-overlay ${collapsed?'kw-collapsed':''} ${offline?'kw-offline':''} ${skin&&!artwork?.available?'kw-custom-skin':''} ${artwork?.available?'kw-art-skin':''}`} style={{left:pos.x,top:pos.y}} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
         <style>{css}</style>
-        <button type="button" className={`kw-pet ${!artwork?.available&&anim?`is-${anim}`:''}`} aria-label={collapsed?`${description}，展开伙伴`:`${description}，互动菜单`} title={collapsed?`${description} · 点击展开`:description} aria-expanded={collapsed?undefined:menu} onClick={()=>{if(suppressClick.current)return;if(collapsed){toggle();return;}setMenu(old=>!old);setBubble('');}}>
+        <button type="button" className={`kw-pet ${!collapsed&&!artwork?.moodInteractions&&anim?`is-${anim}`:''}`} aria-label={collapsed?`${description}，展开伙伴`:`${description}，互动菜单`} title={collapsed?`${description} · 点击展开`:description} aria-expanded={collapsed?undefined:menu} onClick={()=>{if(suppressClick.current)return;if(collapsed){toggle();return;}setMenu(old=>!old);setBubble('');}}>
           <span className="kw-portrait-stage">
-            <img key={portrait} src={portrait} alt="" draggable={false} onError={e=>{const image=e.currentTarget;if(!image.dataset.fallback){image.dataset.fallback='1';image.src=fallback===portrait?`${PREFIX}/portrait.png`:fallback;}else if(image.dataset.fallback==='1'){image.dataset.fallback='2';image.src=`${PREFIX}/portrait.png`;}}}/>
-            {!collapsed&&!artwork?.available&&anim==='pet'&&<span className="kw-interaction-art kw-pat" aria-hidden="true">
+            <img key={portrait} src={portrait} alt="" draggable={false} onError={e=>fallbackInteraction(e,displayMood,skin,artwork)}/>
+            {!collapsed&&!artwork?.moodInteractions&&anim==='pet'&&<span className="kw-interaction-art kw-pat" aria-hidden="true">
               <svg className="kw-pat-hand" viewBox="0 0 64 48"><path d="M57 15 36 7c-4-2-7 3-3 5l8 4-23-5c-5-1-6 5-2 6l18 5-24-3c-5 0-5 6-1 7l25 3-20 1c-5 1-4 6 0 6l24 1-8 3c-4 2-2 7 2 6l17-6c7-3 9-9 10-15Z" fill="#ffe6cf" stroke="#796073" strokeWidth="2.2" strokeLinejoin="round"/><path d="m54 12 6 2-1 15-7-2" fill="#b5e2f6" stroke="#796073" strokeWidth="2.2"/></svg>
             </span>}
-            {!collapsed&&!artwork?.available&&anim==='feed'&&<span className="kw-interaction-art kw-feed" aria-hidden="true">
+            {!collapsed&&!artwork?.moodInteractions&&anim==='feed'&&<span className="kw-interaction-art kw-feed" aria-hidden="true">
               <svg className="kw-snack" viewBox="0 0 48 48"><circle cx="24" cy="24" r="19" fill="#eec18a" stroke="#966b43" strokeWidth="2.5"/><path d="M14 16h3m11-4h3m2 18h3m-20 3h3m5-12h3" stroke="#916243" strokeWidth="4" strokeLinecap="round"/><circle cx="31" cy="23" r="2" fill="#fff1d4"/></svg>
             </span>}
           </span>

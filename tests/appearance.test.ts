@@ -29,14 +29,14 @@ test('missing or unavailable local appearance keeps the user skin and never uses
 });
 
 test('GIF playback has a fresh cache identity and yields to stills when motion is reduced or window hidden',()=>{
- const pack={available:true,version:'generation 2'};
+ const pack={available:true,version:'generation 2',moodInteractions:true};
  const pet=(id:string,reduced=false,visible=true)=>interactionPortrait('担心','/skin',pack,'pet',reduced,visible,id);
- assert.match(pet('1'),/\/pet\.gif\?v=generation%202&play=1$/);
+ assert.match(pet('1'),/\/pet-worried\.gif\?v=generation%202&play=1$/);
  assert.notEqual(pet('1'),pet('2'));
- assert.equal(pet('1',true),'/keep-whale/art/pet.png?v=generation%202');
- assert.equal(pet('1',false,false),'/keep-whale/art/pet.png?v=generation%202');
+ assert.equal(pet('1',true),'/keep-whale/art/pet-worried.png?v=generation%202');
+ assert.equal(pet('1',false,false),'/keep-whale/art/pet-worried.png?v=generation%202');
  assert.equal(interactionPortrait('担心','/skin',pack,null,false,true,'1'),'/keep-whale/art/worried.png?v=generation%202');
- assert.match(interactionPortrait('担心','/skin',pack,'feed',false,true,'1'),/\/feed\.gif\?/);
+ assert.match(interactionPortrait('担心','/skin',pack,'feed',false,true,'1'),/\/feed-worried\.gif\?/);
 });
 
 test('collapsed thumbnail is square, preserves the bottom-right anchor and stays within the viewport',()=>{
@@ -57,7 +57,7 @@ test('overlay renders a square collapsed avatar and plays then restores mood wit
  const values=new Map<string,string>([['dsh-keep-whale:position',JSON.stringify({x:500,y:300})]]);
  const media:any={matches:false,callback:null,addEventListener:(_name:string,fn:()=>void)=>{media.callback=fn;},removeEventListener:()=>{}};
  const doc:any={visibilityState:'visible',addEventListener:()=>{},removeEventListener:()=>{}};
- const state:any={token:'synthetic',companion:{name:'测试伙伴',mood:'担心'},settings:{skin:'/keep-whale/media/custom',quiet:false},appearance:{available:true,version:'test',durations:{pet:1800,feed:2200}},ledger:[],interactions:[],messages:[],unread:2,jobs:[],usage:{},models:[],busy:false,revision:1};
+ const state:any={token:'synthetic',companion:{name:'测试伙伴',mood:'担心'},settings:{skin:'/keep-whale/media/custom',quiet:false},appearance:{available:true,version:'test',moodInteractions:true,durations:{pet:1800,feed:2200}},ledger:[],interactions:[],messages:[],unread:2,jobs:[],usage:{},models:[],busy:false,revision:1};
  const react:any={createElement:(type:any,props:any,...children:any[])=>({type,props:props||{},children}),Fragment:'fragment',
   useState:(initial:any)=>{const all=hooks.get(current)!;const i=index++;if(!(i in all))all[i]=typeof initial==='function'?initial():initial;return [all[i],(v:any)=>{all[i]=typeof v==='function'?v(all[i]):v;}];},
   useEffect:(fn:()=>unknown)=>{effects.push(fn);},useLayoutEffect:()=>{},useRef:(value:any)=>react.useState({current:value})[0],useCallback:(fn:any)=>fn};
@@ -84,12 +84,14 @@ test('overlay renders a square collapsed avatar and plays then restores mood wit
  pet=nodes(tree).find(n=>n.type==='button'&&String(n.props.className).startsWith('kw-pet'));pet.props.onClick();tree=render();
  nodes(tree).find(n=>n.type==='button'&&text(n)==='摸摸').props.onClick();await flush();tree=render();
  pet=nodes(tree).find(n=>n.type==='button'&&String(n.props.className).startsWith('kw-pet'));
- assert.match(nodes(pet).find(n=>n.type==='img').props.src,/\/pet\.gif\?v=test&play=/);
+ assert.match(nodes(pet).find(n=>n.type==='img').props.src,/\/pet-worried\.gif\?v=test&play=/);
  assert.equal(posts.filter(p=>p.action==='interaction').length,1);assert.equal(posts.some(p=>p.action==='chat'),false);
+ state.companion.mood='沮丧';tree=render();pet=nodes(tree).find(n=>n.type==='button'&&String(n.props.className).startsWith('kw-pet'));assert.match(nodes(pet).find(n=>n.type==='img').props.src,/pet-worried\.gif/);
+ const failedImage:any={dataset:{},src:''};nodes(pet).find(n=>n.type==='img').props.onError({currentTarget:failedImage});assert.equal(failedImage.src,'/keep-whale/art/worried.png?v=test');nodes(pet).find(n=>n.type==='img').props.onError({currentTarget:failedImage});assert.equal(failedImage.src,'/keep-whale/media/custom');nodes(pet).find(n=>n.type==='img').props.onError({currentTarget:failedImage});assert.equal(failedImage.src,'/keep-whale/portrait.png');nodes(pet).find(n=>n.type==='img').props.onError({currentTarget:failedImage});assert.equal(failedImage.src,'/keep-whale/portrait.png');
  media.matches=true;media.callback();tree=render();pet=nodes(tree).find(n=>n.type==='button'&&String(n.props.className).startsWith('kw-pet'));
- assert.equal(nodes(pet).find(n=>n.type==='img').props.src,'/keep-whale/art/pet.png?v=test');
+ assert.equal(nodes(pet).find(n=>n.type==='img').props.src,'/keep-whale/art/pet-worried.png?v=test');
  const end=[...timers.values()].find(t=>t.ms===1800);assert.ok(end);end.fn();tree=render();pet=nodes(tree).find(n=>n.type==='button'&&String(n.props.className).startsWith('kw-pet'));
- assert.equal(nodes(pet).find(n=>n.type==='img').props.src,'/keep-whale/art/worried.png?v=test');assert.equal(state.companion.mood,'担心');
+ assert.equal(nodes(pet).find(n=>n.type==='img').props.src,'/keep-whale/art/sad.png?v=test');assert.equal(state.companion.mood,'沮丧');
 });
 
 test('settings preview opens on demand and replays locally without changing mood or creating interactions',async()=>{
@@ -99,7 +101,7 @@ test('settings preview opens on demand and replays locally without changing mood
  const hooks=new Map<any,any[]>(),effects:Array<()=>unknown>=[],timers=new Map<number,{fn:()=>void;ms:number}>(),posts:any[]=[];
  const media:any={matches:false,callback:null,addEventListener:(_name:string,fn:()=>void)=>{media.callback=fn;},removeEventListener:()=>{}};
  const doc:any={visibilityState:'visible',addEventListener:()=>{},removeEventListener:()=>{}};
- const state:any={token:'synthetic',companion:{name:'测试伙伴',mood:'担心'},settings:{skin:'/keep-whale/media/custom',quiet:false,model:null,unit:'积分',dailyLimit:100,prices:null,pointsPerYuan:null,excludedSessions:[],excludedWorkspaces:[]},appearance:{available:true,version:'preview',durations:{pet:1800,feed:2200}},ledger:[],interactions:[],messages:[],unread:0,jobs:[],usage:{},models:[],busy:false,revision:1};
+ const state:any={token:'synthetic',companion:{name:'测试伙伴',mood:'担心'},settings:{skin:'/keep-whale/media/custom',quiet:false,model:null,unit:'积分',dailyLimit:100,prices:null,pointsPerYuan:null,excludedSessions:[],excludedWorkspaces:[]},appearance:{available:true,version:'preview',moodInteractions:true,durations:{pet:1800,feed:2200}},ledger:[],interactions:[],messages:[],unread:0,jobs:[],usage:{},models:[],busy:false,revision:1};
  const react:any={createElement:(type:any,props:any,...children:any[])=>({type,props:props||{},children}),Fragment:'fragment',
   useState:(initial:any)=>{const all=hooks.get(current)!;const i=index++;if(!(i in all))all[i]=typeof initial==='function'?initial():initial;return [all[i],(v:any)=>{all[i]=typeof v==='function'?v(all[i]):v;}];},
   useEffect:(fn:()=>unknown)=>{effects.push(fn);},useLayoutEffect:()=>{},useRef:(value:any)=>react.useState({current:value})[0],useCallback:(fn:any)=>fn};
@@ -118,12 +120,28 @@ test('settings preview opens on demand and replays locally without changing mood
  assert.equal(nodes(previewTree).filter(n=>n.type==='img').length,0,'closed preview does not load images');
  nodes(previewTree).find(n=>n.type==='details').props.onToggle({currentTarget:{open:true}});previewTree=render(preview);
  const figures=nodes(previewTree).filter(n=>n.type==='figure');assert.equal(figures.length,8);assert.deepEqual(figures.map(f=>text(f)),['平静','开心','期待','担心','沮丧','不满','害羞','释然']);
+ const moodSelect=nodes(previewTree).find(n=>n.type==='select'&&n.props['aria-label']==='预览心情');assert.ok(moodSelect);moodSelect.props.onChange({currentTarget:{value:'害羞'}});previewTree=render(preview);assert.equal(nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='当前心情预览').props.src,'/keep-whale/art/shy.png?v=preview');moodSelect.props.onChange({currentTarget:{value:'担心'}});previewTree=render(preview);
  const play=(title:string)=>nodes(previewTree).find(n=>n.type==='button'&&text(n)===title).props.onClick();
- play('预览摸摸');previewTree=render(preview);let image=nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='摸摸动作预览');assert.match(image.props.src,/\/pet\.gif\?v=preview&play=/);const first=image.props.src;
+ play('预览摸摸');previewTree=render(preview);let image=nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='摸摸动作预览');assert.match(image.props.src,/\/pet-worried\.gif\?v=preview&play=/);const first=image.props.src;
  play('预览摸摸');previewTree=render(preview);image=nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='摸摸动作预览');assert.notEqual(image.props.src,first);
- media.matches=true;media.callback();previewTree=render(preview);image=nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='摸摸动作预览');assert.equal(image.props.src,'/keep-whale/art/pet.png?v=preview');
- play('预览喂食');previewTree=render(preview);image=nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='喂食动作预览');assert.equal(image.props.src,'/keep-whale/art/feed.png?v=preview');
+ media.matches=true;media.callback();previewTree=render(preview);image=nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='摸摸动作预览');assert.equal(image.props.src,'/keep-whale/art/pet-worried.png?v=preview');
+ play('预览喂食');previewTree=render(preview);image=nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='喂食动作预览');assert.equal(image.props.src,'/keep-whale/art/feed-worried.png?v=preview');
  const end=[...timers.values()].find(t=>t.ms===2200);assert.ok(end);end.fn();previewTree=render(preview);image=nodes(previewTree).find(n=>n.type==='img'&&n.props.alt==='当前心情预览');assert.equal(image.props.src,'/keep-whale/art/worried.png?v=preview');
  assert.equal(posts.length,0);assert.equal(state.interactions.length,0);assert.equal(state.companion.mood,'担心');
  state.appearance={available:false,version:null};settingsTree=render(settings);assert.match(text(settingsTree),/当前形象未关联表情与动作素材/);assert.equal(nodes(settingsTree).some(n=>typeof n.type==='function'&&n.type.name==='AppearancePreview'),false);
+});
+
+test('legacy packs never switch to their generic interaction pose',()=>{
+ const pack={available:true,version:'v1'};
+ for(const kind of ['pet','feed'] as const)for(const mood of ['担心','沮丧','不满'])assert.equal(interactionPortrait(mood,'/skin',pack,kind,false,true,'x'),moodPortrait(mood,'/skin',pack));
+});
+
+test('every mood and interaction selects its own corresponding animation and reduced-motion still',()=>{
+ const pack={available:true,version:'mood-v2',moodInteractions:true};
+ const moods={平静:'calm',开心:'happy',期待:'expectant',担心:'worried',沮丧:'sad',不满:'annoyed',害羞:'shy',释然:'relieved'};
+ for(const [mood,asset] of Object.entries(moods))for(const kind of ['pet','feed'] as const){
+  assert.equal(interactionPortrait(mood,'/skin',pack,kind,false,true,'play'),`/keep-whale/art/${kind}-${asset}.gif?v=mood-v2&play=play`);
+  assert.equal(interactionPortrait(mood,'/skin',pack,kind,true,true,'play'),`/keep-whale/art/${kind}-${asset}.png?v=mood-v2`);
+ }
+ assert.equal(interactionPortrait('未知','/skin',pack,'pet',false,true,'x'),'/keep-whale/art/pet-calm.gif?v=mood-v2&play=x');
 });
