@@ -261,6 +261,34 @@ export class Store {
     const row = this.db.prepare('SELECT data FROM messages WHERE request_id=? AND role=?').get(requestId, role);
     return row ? parse<Message>(row.data) : undefined;
   }
+  /** Keep only timing, not deleted messages or their content, for contact pacing. */
+  private saveContactTime(key: 'contact:lastProactiveAt' | 'contact:lastUserAt', at: unknown): void {
+    if (typeof at !== 'number' || !Number.isFinite(at) || at < 0) return;
+    const previous = this.getMeta<unknown>(key);
+    if (typeof previous !== 'number' || !Number.isFinite(previous) || previous < at) this.setMeta(key, at);
+  }
+  private rememberContact(message: Message, at = message.createdAt): void {
+    if (message.status !== 'complete') return;
+    if (message.role === 'assistant' && message.origin === 'proactive') this.saveContactTime('contact:lastProactiveAt', at);
+    if (message.role === 'user') this.saveContactTime('contact:lastUserAt', at);
+  }
+  contactTimestamps(): { lastProactiveAt: number | null; lastUserAt: number | null } {
+    // Legacy entries predate the high-water marks, so search all persisted
+    // messages rather than the UI's limited or paginated message window.
+    const recent = (role: 'assistant' | 'user', proactive: boolean): number | null => {
+      const row = this.db.prepare(`SELECT created_at FROM messages WHERE role=? AND json_extract(data,'$.status')='complete'${proactive ? " AND json_extract(data,'$.origin')='proactive'" : ''} ORDER BY created_at DESC,rowid DESC LIMIT 1`).get(role);
+      const n = row ? Number(row.created_at) : NaN;
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    };
+    const combine = (stored: unknown, history: number | null): number | null => {
+      const valid = typeof stored === 'number' && Number.isFinite(stored) && stored >= 0 ? stored : null;
+      return valid === null ? history : history === null ? valid : Math.max(valid, history);
+    };
+    return {
+      lastProactiveAt: combine(this.getMeta('contact:lastProactiveAt'), recent('assistant', true)),
+      lastUserAt: combine(this.getMeta('contact:lastUserAt'), recent('user', false)),
+    };
+  }
   getMessage(id: string): Message | undefined { const row = this.db.prepare('SELECT data FROM messages WHERE id=?').get(id); return row ? parse<Message>(row.data) : undefined; }
   putMessage(message: Message): boolean {
     bounded(message.id, '消息 ID', 200); bounded(message.requestId, '请求 ID', 200);
@@ -268,7 +296,9 @@ export class Store {
     if (typeof message.text !== 'string' || message.text.length > 200_000 || !Array.isArray(message.images) || message.images.length > 8) throw new Error('消息内容过长或格式无效');
     return this.transaction(() => {
       const result = this.db.prepare('INSERT OR IGNORE INTO messages(id,request_id,role,created_at,data) VALUES(?,?,?,?,?)').run(message.id, message.requestId, message.role, message.createdAt, JSON.stringify(message));
-      return Number(result.changes) > 0;
+      const inserted = Number(result.changes) > 0;
+      if (inserted) this.rememberContact(message);
+      return inserted;
     });
   }
   updateMessage(id: string, patch: Partial<Message>): Message | undefined {
@@ -277,12 +307,18 @@ export class Store {
       // Identity and provenance are immutable, preventing a retry from becoming a second user turn.
       const next = { ...m, ...patch, id: m.id, chatId: m.chatId, requestId: m.requestId, role: m.role, createdAt: m.createdAt, origin: m.origin };
       if (!['streaming', 'complete', 'failed', 'cancelled'].includes(next.status) || typeof next.text !== 'string' || next.text.length > 200_000 || !Array.isArray(next.images)) throw new Error('消息格式无效');
-      this.db.prepare('UPDATE messages SET data=? WHERE id=?').run(JSON.stringify(next), id); return next;
+      this.db.prepare('UPDATE messages SET data=? WHERE id=?').run(JSON.stringify(next), id);
+      if (m.status !== 'complete' && next.status === 'complete') this.rememberContact(next, Math.max(next.createdAt, this.clock()));
+      return next;
     });
   }
   deleteMessages(ids: string[]): void {
     if (!Array.isArray(ids) || ids.length > 5000 || ids.some(id => typeof id !== 'string')) throw new Error('删除消息范围无效');
     this.transaction(() => {
+      // Capture legacy messages before deletion, without keeping their bodies.
+      const times = this.contactTimestamps();
+      this.saveContactTime('contact:lastProactiveAt', times.lastProactiveAt);
+      this.saveContactTime('contact:lastUserAt', times.lastUserAt);
       const get = this.db.prepare('SELECT request_id FROM messages WHERE id=?');
       const requests = new Set(ids.map(id => get.get(id)).filter(Boolean).map(row => String(row!.request_id)));
       const pairs = [...requests].flatMap(requestId => this.db.prepare('SELECT id,role FROM messages WHERE request_id=?').all(requestId));

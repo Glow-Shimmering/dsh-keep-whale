@@ -53,7 +53,8 @@ function validRecord(v:BiliRecord):BiliRecord {
   return {id:id(v.id),video,origin:v.origin,...(v.recommendedAt===undefined?{}:{recommendedAt:finite(v.recommendedAt)}),createdAt:now,
     summary:text(v.summary,5000),opinion:text(v.opinion,5000),topics:list(v.topics,12,100),coverage:text(v.coverage,3000),limitations:list(v.limitations,20,1000),excerpts,frameTimes,
     liked:flag(v.liked),favorited:flag(v.favorited),actionReason:text(v.actionReason,2000,true),...(v.actionError?{actionError:text(v.actionError,1000)}:{}),
-    shareText:text(v.shareText,2000,true),shareStatus:v.shareStatus,...(v.sharedAt===undefined?{}:{sharedAt:finite(v.sharedAt)}),...(v.discussedAt===undefined?{}:{discussedAt:finite(v.discussedAt)}),version:finite(v.version,1)};
+    shareText:text(v.shareText,2000,true),shareStatus:v.shareStatus,...(v.sharedAt===undefined?{}:{sharedAt:finite(v.sharedAt)}),
+    ...(v.discussedAt===undefined?{}:{discussedAt:finite(v.discussedAt)}),version:finite(v.version,1)};
 }
 function validAttempt(v:BiliAttempt):BiliAttempt {
   if(!v||!['autonomous','recommended'].includes(v.origin)||!['running','succeeded','failed','interrupted','skipped'].includes(v.status))throw new Error('任务状态无效');
@@ -119,6 +120,18 @@ export class BiliStore {
   pendingShares(limit=20):BiliRecord[] {
     if(!Number.isInteger(limit)||limit<1||limit>500)throw new Error('查询数量无效');
     return this.db.prepare("SELECT data FROM bili_records WHERE json_extract(data,'$.shareStatus')='pending' ORDER BY created_at ASC,id ASC LIMIT ?").all(limit).map(r=>parse<BiliRecord>(r.data));
+  }
+  newestPendingShare():BiliRecord|null {
+    return this.tx(()=>{
+      const row=this.db.prepare("SELECT data FROM bili_records WHERE json_extract(data,'$.shareStatus')='pending' ORDER BY created_at DESC,id DESC LIMIT 1").get();
+      if(!row)return null;
+      const newest=parse<BiliRecord>(row.data);
+      this.db.prepare("UPDATE bili_records SET data=json_set(data,'$.shareStatus','skipped','$.shareText','','$.version',json_extract(data,'$.version')+1) WHERE id<>? AND json_extract(data,'$.shareStatus')='pending'").run(newest.id);
+      return newest;
+    });
+  }
+  discardPendingShares():void {
+    this.tx(()=>this.db.prepare("UPDATE bili_records SET data=json_set(data,'$.shareStatus','expired','$.shareText','','$.version',json_extract(data,'$.version')+1) WHERE json_extract(data,'$.shareStatus')='pending'").run());
   }
   record(key:string):BiliRecord|null {const r=this.db.prepare('SELECT data FROM bili_records WHERE id=?').get(id(key));return r?parse<BiliRecord>(r.data):null;}
   hasVideo(value:string):boolean {return !!this.db.prepare('SELECT 1 FROM bili_records WHERE bvid=? LIMIT 1').get(bvid(value));}
@@ -240,7 +253,7 @@ export class BiliStore {
   }
   recover():void {
     this.tx(()=>{for(const row of this.db.prepare('SELECT data FROM bili_attempts').all()) {const a=parse<BiliAttempt>(row.data);if(a.status==='running'){a.status='interrupted';a.stage='已中断';a.reason='DSH 已退出，本次未继续';a.updatedAt=this.now();this.db.prepare('UPDATE bili_attempts SET data=? WHERE id=?').run(JSON.stringify(a),a.id);}}
-      for(const row of this.db.prepare('SELECT data FROM bili_records').all()){const r=parse<BiliRecord>(row.data);if(r.shareStatus==='pending'){r.shareStatus='expired';r.version++;this.db.prepare('UPDATE bili_records SET data=? WHERE id=?').run(JSON.stringify(r),r.id);}}
+      for(const row of this.db.prepare('SELECT data FROM bili_records').all()){const r=parse<BiliRecord>(row.data);if(r.shareStatus==='pending'){r.shareStatus='expired';r.shareText='';r.version++;this.db.prepare('UPDATE bili_records SET data=? WHERE id=?').run(JSON.stringify(r),r.id);}}
       for(const row of this.db.prepare('SELECT data FROM bili_recommendations').all()){const r=parse<BiliRecommendation>(row.data);if(r.status==='pending'||r.status==='started'){r.status='failed';r.reason='DSH 已退出，请重新推荐';this.db.prepare('UPDATE bili_recommendations SET data=? WHERE id=?').run(JSON.stringify(r),r.id);}}
       this.bump();
     });

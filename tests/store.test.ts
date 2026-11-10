@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Store, beijingDay } from '../src/core/store.js';
 import type { Job, Message, Source } from '../src/types.js';
 
@@ -292,6 +293,73 @@ test('findRequest resolves idempotency directly across full history', () => {
     assert.equal(e.store.findRequest('stable-request', 'assistant')?.id, 'assistant');
     assert.equal(e.store.putMessage(msg('another-user', 'stable-request', 'user', e.clock())), false);
   } finally { e.cleanup(); }
+});
+
+test('contact high-water marks count only completed real contacts, survive deletion and ignore duplicates', () => {
+  const e=setup();
+  try {
+    assert.deepEqual(e.store.contactTimestamps(),{lastProactiveAt:null,lastUserAt:null});
+    const first=e.clock();
+    const incomplete={...msg('pending','pending','user',first),status:'streaming' as const};
+    e.store.putMessage(incomplete);
+    e.store.putMessage({...msg('failed','failed','assistant',first),origin:'proactive',status:'failed'});
+    e.store.putMessage(msg('chat-answer','chat-answer','assistant',first));
+    assert.deepEqual(e.store.contactTimestamps(),{lastProactiveAt:null,lastUserAt:null});
+    e.advance(1000);e.store.updateMessage('pending',{status:'complete'});
+    const userAt=e.clock();
+    e.store.putMessage({...msg('proactive','proactive','assistant',e.clock()),origin:'proactive',status:'streaming'});
+    e.advance(1000);e.store.updateMessage('proactive',{status:'complete'});
+    const proactiveAt=e.clock();
+    assert.deepEqual(e.store.contactTimestamps(),{lastProactiveAt:proactiveAt,lastUserAt:userAt});
+    e.advance(1000);
+    assert.equal(e.store.putMessage(msg('duplicate','pending','user',e.clock())),false);
+    assert.equal(e.store.putMessage({...msg('duplicate-assistant','proactive','assistant',e.clock()),origin:'proactive'}),false);
+    e.store.updateMessage('proactive',{text:'updated without a new send'});
+    assert.deepEqual(e.store.contactTimestamps(),{lastProactiveAt:proactiveAt,lastUserAt:userAt});
+    e.store.deleteMessages(['pending','proactive']);
+    assert.equal(e.store.getMessage('pending'),undefined);assert.equal(e.store.getMessage('proactive'),undefined);
+    e.store.close();
+    const reopened=new Store(e.root,e.clock);
+    try {
+      assert.deepEqual(reopened.contactTimestamps(),{lastProactiveAt:proactiveAt,lastUserAt:userAt});
+      assert.equal(reopened.getMessage('pending'),undefined);assert.equal(reopened.getMessage('proactive'),undefined);
+    } finally {reopened.close();}
+    const db=new DatabaseSync(join(e.root,'keep-whale.sqlite'),{readOnly:true});
+    try {
+      const data=db.prepare("SELECT key,data FROM meta WHERE key IN ('contact:lastProactiveAt','contact:lastUserAt') ORDER BY key").all();
+      assert.equal(data.length,2);assert.ok(data.every(row=>typeof JSON.parse(String(row.data))==='number'));
+    } finally {db.close();}
+  } finally {e.cleanup();}
+});
+
+test('legacy contact timestamps search beyond paginated history and survive deletion without first reading them', () => {
+  const e=setup();
+  try {
+    const userAt=e.clock()-5000,proactiveAt=e.clock()-4000;
+    e.store.close();
+    const db=new DatabaseSync(join(e.root,'keep-whale.sqlite'));
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      const insert=db.prepare('INSERT INTO messages(id,request_id,role,created_at,data) VALUES(?,?,?,?,?)');
+      const add=(m:Message)=>insert.run(m.id,m.requestId,m.role,m.createdAt,JSON.stringify(m));
+      add(msg('legacy-user','legacy-user','user',userAt));
+      add({...msg('legacy-proactive','legacy-proactive','assistant',proactiveAt),origin:'proactive'});
+      for(let i=0;i<5001;i++)add(msg('later-'+i,'later-'+i,'assistant',e.clock()+i));
+      db.exec('COMMIT');
+    } finally {db.close();}
+    const reopened=new Store(e.root,e.clock);
+    try {
+      assert.equal(reopened.messages(5000).some(m=>m.id==='legacy-user'||m.id==='legacy-proactive'),false);
+      // The first contact lookup occurs inside deletion, so older databases do
+      // not lose their last contact when the user deletes historical messages.
+      reopened.deleteMessages(['legacy-user','legacy-proactive']);
+      assert.deepEqual(reopened.contactTimestamps(),{lastProactiveAt:proactiveAt,lastUserAt:userAt});
+      assert.equal(reopened.getMessage('legacy-user'),undefined);assert.equal(reopened.getMessage('legacy-proactive'),undefined);
+    } finally {reopened.close();}
+    const restored=new Store(e.root,e.clock);
+    try {assert.deepEqual(restored.contactTimestamps(),{lastProactiveAt:proactiveAt,lastUserAt:userAt});}
+    finally {restored.close();}
+  } finally {e.cleanup();}
 });
 
 test('budget acknowledgment rejects an uncertain nested call while its enclosing Bilibili job runs',()=>{

@@ -12,19 +12,23 @@ import type { HostContext } from '../src/types.js';
 const route={provider:'test',model:'vision'};
 const video:BiliVideo={bvid:'BV1xx411c7mD',aid:123,cid:456,title:'游戏操作教学',owner:'UP 主',ownerId:'1234',duration:100,url:'https://www.bilibili.com/video/BV1xx411c7mD'};
 const material=():BiliMaterial=>({video:{...video},subtitles:[{from:0,to:5,text:'教学从掩体出发'}, {from:40,to:45,text:'选择合适时机'}],frames:[{at:2,data:Buffer.from('synthetic-frame-a'),mediaType:'image/jpeg'},{at:50,data:Buffer.from('synthetic-frame-b'),mediaType:'image/jpeg'}],subtitleLanguage:'zh',coverage:'全片字幕，抽取两帧',limitations:['抽样不等于逐秒观看']});
-const prior=(id:string):Omit<BiliRecord,'version'>=>({id,video:{...video,bvid:'BV1xx411c7mE',title:'先前的视频'},origin:'autonomous',createdAt:Date.now(),summary:'内容',opinion:'看法',topics:['游戏'],coverage:'字幕和画面',limitations:['抽样画面'],excerpts:[{from:0,to:3,text:'以前的字幕'}],frameTimes:[1],liked:false,favorited:false,actionReason:'',shareText:'我看到一条有趣的内容。',shareStatus:'pending'});
+const prior=(id:string):Omit<BiliRecord,'version'>=>({id,video:{...video,bvid:'BV1xx411c7mE',title:'先前的视频'},origin:'autonomous',createdAt:Date.now(),summary:'内容',opinion:'看法',topics:['游戏'],coverage:'字幕和画面',limitations:['抽样画面'],excerpts:[{from:0,to:3,text:'以前的字幕'}],frameTimes:[1],liked:false,favorited:false,actionReason:'',shareText:'',shareStatus:'pending'});
 const waitFor=async(fn:()=>boolean)=>{for(let i=0;i<100;i++){if(fn())return;await new Promise(r=>setTimeout(r,10));}assert.fail('task did not settle');};
+const putMessage=(store:Store,id:string,role:'user'|'assistant',createdAt:number,origin:'chat'|'proactive'='chat',text='一条真实的交流')=>store.putMessage({id,chatId:store.companion().id,role,text,images:[],status:'complete',createdAt,origin,requestId:id});
 function setup(){
  const root=mkdtempSync(join(tmpdir(),'whale-bili-service-')),store=new Store(root),calls:any[]=[],providerCalls:string[]=[];
- let canBrowse=true,canDeliver=true,networkFailure=false,noUsage=false,truncateCalls=0,hold:Promise<void>|null=null,content=material(), accountLoggedIn=true,engage=false,segmentResponses:unknown[]=[],reflectionResponses:unknown[]=[],lowerBudgetAfterSegment=false;
+ let canBrowse=true,canDeliver=true,networkFailure=false,noUsage=false,truncateCalls=0,hold:Promise<void>|null=null,holdShare:Promise<void>|null=null,content=material(), accountLoggedIn=true,engage=false,segmentResponses:unknown[]=[],reflectionResponses:unknown[]=[],shareResponses:unknown[]=[],lowerBudgetAfterSegment=false,wantShare=false,shareFailure=false;
  const llm={resolveModelInfo:async()=>({inputModalities:['text','image'],context:{contextWindow:1000000}}),imageRequestPricing:()=>({priceImages:(images:any[])=>images.map(()=>({visualTokens:256,text:''}))}),
   async *stream(options:any){calls.push(options);if(hold)await hold;
    const segment=options.system.includes('一个片段');
-   const response=options.system.includes('挑选自己')?{bvid:video.bvid,reason:'对内容好奇'}:segment?(segmentResponses.length?segmentResponses.shift():{notes:'字幕描述操作，画面展示场景',limitations:['画面为抽样']}):(reflectionResponses.length?reflectionResponses.shift():{summary:'视频介绍了游戏操作。',opinion:'步骤具体，但效果仍需实测。',topics:['游戏'],limitations:['抽样不等于完整视觉'],share:true,shareText:'我看到一个操作讲解，步骤还挺具体。',like:engage,favorite:engage,actionReason:engage?'内容值得对照练习':''});
+   const sharing=options.system.includes('【此刻是否想分享】');
+   if(sharing&&holdShare)await holdShare;
+   const share={share:true,shareKind:'reaction',shareReason:'操作时机引发了一个值得聊的具体想法',shareText:'这个时机的选择让我想起一件事：犹豫有时比操作失误更难补救。'};
+   const response=options.system.includes('挑选自己')?{bvid:video.bvid,reason:'对内容好奇'}:segment?(segmentResponses.length?segmentResponses.shift():{notes:'字幕描述操作，画面展示场景',limitations:['画面为抽样']}):sharing?(shareResponses.length?shareResponses.shift():share):(reflectionResponses.length?reflectionResponses.shift():{summary:'视频介绍了游戏操作。',opinion:'步骤具体，但效果仍需实测。',topics:['游戏'],limitations:['抽样不等于完整视觉'],...share,share:wantShare,like:engage,favorite:engage,actionReason:engage?'内容值得对照练习':''});
    if(segment&&lowerBudgetAfterSegment){lowerBudgetAfterSegment=false;store.patchSettings({dailyLimit:.05});}
-   yield {type:'text-delta',text:JSON.stringify(response)};
+   if(!sharing||!shareFailure)yield {type:'text-delta',text:JSON.stringify(response)};
    if(!noUsage)yield {type:'usage',usage:{inputTokens:200,outputTokens:80,cacheReadTokens:100,cacheWriteTokens:0}};
-   const truncated=truncateCalls>0;if(truncated)truncateCalls--;yield {type:'finish',reason:{kind:truncated?'max-tokens':'stop'}};
+   const truncated=truncateCalls>0;if(truncated)truncateCalls--;yield {type:'finish',reason:{kind:sharing&&shareFailure?'error':truncated?'max-tokens':'stop'}};
   }};
  const provider:BiliProvider={setExpectedMid:()=>{},available:()=>true,
   account:async()=>{providerCalls.push('account');return {loggedIn:accountLoggedIn,name:'伙伴账号',mid:accountLoggedIn?'1234':null};},
@@ -36,8 +40,12 @@ function setup(){
  store.patchSettings({model:route,priceRoute:route,prices:{input:30,cached:.6,output:120},dailyLimit:100});
  const engine=new BiliService(root,store,new Model(ctx,store),ctx,{canBrowse:()=>canBrowse,canDeliver:()=>canDeliver,system:()=> '独立伙伴设定'},provider);
  const ready=async()=>{await engine.action({action:'bili.account.check'});await waitFor(()=>!engine.busy());await engine.action({action:'bili.account.confirm',mid:'1234'});await engine.check();};
- return {root,store,engine,ctx,provider,calls,providerCalls,ready,setBrowse:(v:boolean)=>canBrowse=v,setDeliver:(v:boolean)=>canDeliver=v,setNetworkFailure:(v:boolean)=>networkFailure=v,setUsage:(v:boolean)=>noUsage=!v,setTruncate:(n:number)=>truncateCalls=n,setHold:(p:Promise<void>|null)=>hold=p,setMaterial:(v:BiliMaterial)=>content=v,setLoggedIn:(v:boolean)=>accountLoggedIn=v,setEngage:(v:boolean)=>engage=v,setSegmentResponses:(v:unknown[])=>segmentResponses=[...v],setReflectionResponses:(v:unknown[])=>reflectionResponses=[...v],lowerBudgetAfterSegment:()=>lowerBudgetAfterSegment=true,close:async()=>{await engine.dispose();store.close();rmSync(root,{recursive:true,force:true});}};
+ let disposed=false;const disposeEngine=async()=>{if(!disposed){disposed=true;await engine.dispose();}};
+ return {root,store,engine,ctx,provider,calls,providerCalls,ready,disposeEngine,setBrowse:(v:boolean)=>canBrowse=v,setDeliver:(v:boolean)=>canDeliver=v,setNetworkFailure:(v:boolean)=>networkFailure=v,setUsage:(v:boolean)=>noUsage=!v,setTruncate:(n:number)=>truncateCalls=n,setHold:(p:Promise<void>|null)=>hold=p,setHoldShare:(p:Promise<void>|null)=>holdShare=p,setMaterial:(v:BiliMaterial)=>content=v,setLoggedIn:(v:boolean)=>accountLoggedIn=v,setEngage:(v:boolean)=>engage=v,setSegmentResponses:(v:unknown[])=>segmentResponses=[...v],setReflectionResponses:(v:unknown[])=>reflectionResponses=[...v],setShareResponses:(v:unknown[])=>shareResponses=[...v],setWantShare:(v:boolean)=>wantShare=v,setShareFailure:(v:boolean)=>shareFailure=v,lowerBudgetAfterSegment:()=>lowerBudgetAfterSegment=true,close:async()=>{await disposeEngine();store.close();rmSync(root,{recursive:true,force:true});}};
 }
+const addDraft=(x:ReturnType<typeof setup>,id:string,contextId:string|null=null)=>{
+ (x.engine as any).shareDrafts.set(id,{text:'这个角度让我想到了以前的一次练习。',kind:'reaction',reason:'这条内容引发了一个具体想法',contextId,revision:x.store.revision()});
+};
 
 test('not enabled or unconfirmed never begins browsing',async()=>{const x=setup();try{
  await x.engine.tick();assert.deepEqual(x.providerCalls,[]);assert.equal(x.calls.length,0);
@@ -117,10 +125,169 @@ test('recommendation works when autonomous is off, after capability check',async
  }finally{await x.close();}});
 
 test('typing delays share, quiet mode expires it and creates no user message',async()=>{const x=setup();try{
- const r=x.engine.data.saveRecord(prior('old'),x.engine.data.version())!;x.setDeliver(false);x.engine.deliver();assert.equal(x.engine.data.record(r.id)?.shareStatus,'pending');
+ const r=x.engine.data.saveRecord(prior('old'),x.engine.data.version())!;addDraft(x,r.id);x.setDeliver(false);x.engine.deliver();assert.equal(x.engine.data.record(r.id)?.shareStatus,'pending');
  x.setDeliver(true);x.engine.deliver();assert.equal(x.store.messages().length,1);assert.equal(x.store.messages()[0].role,'assistant');assert.equal(x.store.messages()[0].origin,'proactive');
  const next=x.engine.data.saveRecord(prior('next'),x.engine.data.version())!;x.store.patchSettings({quiet:true});x.engine.deliver();assert.equal(x.engine.data.record(next.id)?.shareStatus,'expired');
  x.store.patchSettings({quiet:false});x.engine.deliver();assert.equal(x.store.messages().length,1);assert.equal(x.store.messages().some(m=>m.role==='user'),false);
+ }finally{await x.close();}});
+
+test('a missing share reason or repeated summary is not sent, but the video experience is retained',async()=>{
+ const summary='片段讲述了游戏里的操作时机。';
+ for(const response of [
+  {summary,opinion:'时机很关键。',share:true,shareKind:'reaction',shareText:'我想聊聊什么时候该尝试。'},
+  {summary,opinion:'时机很关键。',share:true,shareKind:'invented-kind',shareReason:'有了一个想法',shareText:'我想聊聊什么时候该尝试。'},
+  {summary,opinion:'时机很关键。',share:true,shareKind:'reaction',shareReason:'有了一个想法',shareText:''},
+  {summary,opinion:'时机很关键。',share:true,shareKind:'discovery',shareReason:'值得看看',shareText:summary},
+ ]){const x=setup();try{
+  await x.ready();x.setReflectionResponses([response]);if(response.shareText===summary)x.setShareResponses([response]);await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+  const record=x.engine.data.records()[0];assert.ok(record);assert.equal(record.shareStatus,'skipped');
+  x.engine.deliver();assert.equal(x.store.messages().length,0);assert.ok(x.calls.length<=3);if(response.shareText!==summary)assert.equal(x.calls.length,2);
+ }finally{await x.close();}}
+});
+
+test('a new message after a share was prepared makes its context stale instead of sending it later',async()=>{const x=setup();try{
+ const r=x.engine.data.saveRecord(prior('prepared'),x.engine.data.version())!;addDraft(x,r.id);
+ putMessage(x.store,'new-topic','user',Date.now()-3000,'chat','换个话题');
+ putMessage(x.store,'new-reply','assistant',Date.now()-2000,'chat','好，我们聊聊别的。');
+ x.engine.deliver();assert.notEqual(x.engine.data.record(r.id)?.shareStatus,'pending');
+ assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,0);
+ }finally{await x.close();}});
+
+test('only the newest share is eligible even when more than one page of pending shares exists',async()=>{const x=setup();try{
+ const now=Date.now();
+ for(let i=0;i<501;i++){
+  const row={...prior('backlog-'+i),createdAt:now-(501-i)*1000};
+  assert.ok(x.engine.data.saveRecord(row,x.engine.data.version()));addDraft(x,row.id);
+ }
+ x.engine.deliver();
+ assert.equal(x.engine.data.pendingShares().length,0);
+ assert.equal(x.engine.data.record('backlog-500')?.shareStatus,'sent');
+ assert.equal(x.engine.data.record('backlog-0')?.shareStatus,'skipped');
+ assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,1);
+ }finally{await x.close();}});
+
+test('recent generic proactive contact blocks a Bilibili share without queueing it',async()=>{const x=setup();try{
+ putMessage(x.store,'general-contact','assistant',Date.now()-2*60_000,'proactive');
+ await x.ready();x.setWantShare(true);await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ const r=x.engine.data.records()[0];assert.ok(r);assert.equal(r.shareStatus,'skipped');
+ x.engine.deliver();assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,1);
+ }finally{await x.close();}});
+
+test('a new viewing experience cannot repeat an earlier proactive share word for word',async()=>{const x=setup();try{
+ const now=Date.now(),old='那个选择时机让我想到，犹豫有时比一次失误更难补救。';
+ putMessage(x.store,'old-share','assistant',now-4*60*60_000,'proactive',old+'\n\n[这条视频]('+video.url+')');
+ putMessage(x.store,'reply-to-old','user',now-3*60*60_000-20*60_000,'chat','确实有点道理。');
+ putMessage(x.store,'reply-finished','assistant',now-3*60*60_000-19*60_000,'chat','嗯，遇到时很容易反应不过来。');
+ await x.ready();x.setReflectionResponses([{summary:'一条不同的游戏视频。',opinion:'它提醒我操作节奏很重要。',share:true,shareKind:'reaction',shareReason:'操作时机让人想起旧观点',shareText:old}]);x.setShareResponses([{share:true,shareKind:'reaction',shareReason:'操作时机让人想起旧观点',shareText:old}]);
+ await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ const r=x.engine.data.records()[0];assert.ok(r);assert.equal(r.shareStatus,'skipped');x.engine.deliver();
+ assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,1);
+ }finally{await x.close();}});
+
+test('unanswered proactive contact can receive new content after three hours, without old shares piling up',async()=>{const x=setup();try{
+ putMessage(x.store,'older-contact','assistant',Date.now()-3*60*60_000-5000,'proactive');
+ const item=prior('fresh-after-wait');
+ const r=x.engine.data.saveRecord(item,x.engine.data.version())!;addDraft(x,r.id,'older-contact');x.engine.deliver();
+ assert.equal(x.engine.data.record(r.id)?.shareStatus,'sent');assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,2);
+ }finally{await x.close();}});
+
+test('a reply to proactive contact does not cancel the minimum share interval',async()=>{const x=setup();try{
+ putMessage(x.store,'earlier-contact','assistant',Date.now()-15*60_000,'proactive');
+ putMessage(x.store,'user-reply','user',Date.now()-14*60_000,'chat');
+ putMessage(x.store,'assistant-reply','assistant',Date.now()-13*60_000,'chat');
+ await x.ready();x.setWantShare(true);await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ const r=x.engine.data.records()[0];assert.ok(r);assert.equal(r.shareStatus,'skipped');
+ x.engine.deliver();assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,1);
+ }finally{await x.close();}});
+
+test('there is no fixed daily share quota when the contact interval and conversation permit it',async()=>{const x=setup();try{
+ const now=Date.now();
+ for(let i=0;i<4;i++){
+  const at=now-(4-i)*46*60_000;
+  putMessage(x.store,'earlier-'+i,'assistant',at,'proactive','过去的一条不同的消息 '+i);
+  putMessage(x.store,'user-'+i,'user',at+60_000,'chat','我看到啦 '+i);
+  putMessage(x.store,'answer-'+i,'assistant',at+120_000,'chat','嗯嗯 '+i);
+ }
+ await x.ready();x.setWantShare(true);await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ const r=x.engine.data.records()[0];assert.ok(r);assert.equal(r.shareStatus,'pending');x.engine.deliver();
+ assert.equal(x.engine.data.record(r.id)?.shareStatus,'sent');assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,5);
+ }finally{await x.close();}});
+
+test('video reflection omits conversation and the optional share call redacts withdrawn evidence',async()=>{const x=setup();try{
+ const now=Date.now(),secret='不要发送的秘密代号';
+ putMessage(x.store,'secret','user',now-80000,'chat',secret);
+ x.store.addSource({id:'chat:secret',kind:'user_fact',text:secret,occasion:'secret',createdAt:now-80000,processed:false,revoked:false});
+ const memory=x.store.saveMemory({kind:'user_fact',text:secret,sourceIds:['chat:secret']})!;x.store.deleteMemories([memory.id]);
+ putMessage(x.store,'last-reply','assistant',now-70000,'chat','收到，我们继续聊。');
+ await x.ready();x.setWantShare(true);await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ const reflection=x.calls.find(c=>c.system.includes('你刚自行了解了一条视频'));assert.ok(reflection);
+ const input=JSON.stringify(reflection.messages);assert.doesNotMatch(input,new RegExp(secret));assert.doesNotMatch(input,/recentConversation|收到，我们继续聊/);
+ const sharing=x.calls.find(c=>c.system.includes('【此刻是否想分享】'));assert.ok(sharing);
+ const shareInput=JSON.stringify(sharing.messages);assert.doesNotMatch(shareInput,new RegExp(secret));assert.match(shareInput,/相关记忆已删除/);
+ const record=x.engine.data.records()[0];assert.equal(record.shareText,'');assert.doesNotMatch(JSON.stringify(record),/操作时机引发了一个值得聊的具体想法|犹豫有时比操作失误更难补救/);
+ const ledger=x.store.ledger().filter(l=>l.budgetScope==='bilibili');assert.equal(ledger.length,3);assert.ok(ledger.every(l=>l.status==='settled'&&l.actual!>0));
+ }finally{await x.close();}});
+
+test('optional share model failure leaves the completed viewing experience intact',async()=>{const x=setup();try{
+ await x.ready();x.setWantShare(true);x.setShareFailure(true);await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ assert.equal(x.engine.data.attempts()[0].status,'succeeded');const record=x.engine.data.records()[0];assert.ok(record);
+ assert.equal(record.shareText,'');assert.notEqual(record.shareStatus,'pending');x.engine.deliver();assert.equal(x.store.messages().length,0);
+ assert.equal(x.calls.filter(c=>c.system.includes('【此刻是否想分享】')).length,1,'optional sharing is not retried');
+ const ledger=x.store.ledger().filter(l=>l.budgetScope==='bilibili');assert.equal(ledger.length,3);assert.ok(ledger.every(l=>l.status==='settled'&&l.actual!>0));
+ }finally{await x.close();}});
+
+test('revoking evidence during the optional share call drops its draft but preserves the completed video',async()=>{const x=setup();let release=()=>{};try{
+ const now=Date.now();putMessage(x.store,'source-user','user',now-80000,'chat','一件暂时分享的事');
+ x.store.addSource({id:'chat:source-user',kind:'user_fact',text:'一件暂时分享的事',occasion:'source-user',createdAt:now-80000,processed:false,revoked:false});
+ const memory=x.store.saveMemory({kind:'user_fact',text:'一件暂时分享的事',sourceIds:['chat:source-user']})!;
+ putMessage(x.store,'last-answer','assistant',now-70000,'chat','我记下了。');
+ await x.ready();x.setWantShare(true);x.setHoldShare(new Promise<void>(resolve=>release=resolve));
+ await x.engine.action({action:'bili.recommend',input:video.bvid});const running=x.engine.tick();
+ await waitFor(()=>x.calls.some(c=>c.system.includes('【此刻是否想分享】')));
+ assert.equal(x.engine.data.records().length,1,'the viewing experience is stored before optional sharing');
+ x.store.deleteMemories([memory.id]);release();await running;
+ const record=x.engine.data.records()[0];assert.ok(record);assert.equal(x.engine.data.attempts()[0].status,'succeeded');
+ assert.equal(record.shareText,'');assert.notEqual(record.shareStatus,'pending');x.engine.deliver();
+ assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,0);
+ }finally{release();await x.close();}});
+
+test('viewing attempt and recommendation are complete before optional sharing, and stay complete if sharing is aborted',async()=>{const x=setup();let release=()=>{};try{
+ await x.ready();x.setWantShare(true);x.setHoldShare(new Promise<void>(resolve=>release=resolve));
+ await x.engine.action({action:'bili.recommend',input:video.bvid});const running=x.engine.tick();
+ await waitFor(()=>x.calls.some(c=>c.system.includes('【此刻是否想分享】')));
+ const attempt=x.engine.data.attempts()[0],record=x.engine.data.records()[0];assert.ok(record);
+ assert.equal(attempt.status,'succeeded');assert.equal(x.store.jobs().find(j=>j.id===attempt.id)?.status,'succeeded');
+ assert.equal(x.engine.data.recommendations()[0].status,'done');
+ x.engine.suppressShares();release();await running;
+ assert.equal(x.engine.data.attempts()[0].status,'succeeded');assert.equal(x.store.jobs().find(j=>j.id===attempt.id)?.status,'succeeded');
+ assert.equal(x.engine.data.recommendations()[0].status,'done');assert.ok(x.engine.data.record(record.id));
+ assert.notEqual(x.engine.data.record(record.id)?.shareStatus,'pending');assert.equal(x.store.messages().length,0);
+ }finally{release();await x.close();}});
+
+test('an in-memory share draft is not restored or sent after restarting the Bilibili service',async()=>{const x=setup();let resumed:BiliService|undefined;try{
+ await x.ready();x.setWantShare(true);await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ const record=x.engine.data.records()[0];assert.equal(record.shareStatus,'pending');assert.equal(record.shareText,'');
+ await x.disposeEngine();
+ resumed=new BiliService(x.root,x.store,new Model(x.ctx,x.store),x.ctx,{canBrowse:()=>true,canDeliver:()=>true,system:()=>''},x.provider);
+ assert.equal(resumed.data.record(record.id)?.shareStatus,'expired');resumed.deliver();assert.equal(x.store.messages().length,0);
+ }finally{if(resumed)await resumed.dispose();await x.close();}});
+
+test('deleting evidence after preparing a share discards that stale draft',async()=>{const x=setup();try{
+ const now=Date.now();putMessage(x.store,'source-user','user',now-80000,'chat','一件暂时分享的事');
+ x.store.addSource({id:'chat:source-user',kind:'user_fact',text:'一件暂时分享的事',occasion:'source-user',createdAt:now-80000,processed:false,revoked:false});
+ const memory=x.store.saveMemory({kind:'user_fact',text:'一件暂时分享的事',sourceIds:['chat:source-user']})!;
+ putMessage(x.store,'last-answer','assistant',now-70000,'chat','我记下了。');
+ const r=x.engine.data.saveRecord(prior('stale-memory'),x.engine.data.version())!;addDraft(x,r.id,'last-answer');
+ x.store.deleteMemories([memory.id]);x.engine.deliver();
+ assert.notEqual(x.engine.data.record(r.id)?.shareStatus,'pending');
+ assert.equal(x.store.messages().filter(m=>m.origin==='proactive').length,0);
+ }finally{await x.close();}});
+
+test('deleting a video with a pending private share clears its in-memory draft immediately',async()=>{const x=setup();try{
+ const record=x.engine.data.saveRecord(prior('video-to-delete'),x.engine.data.version())!;addDraft(x,record.id);
+ assert.equal((x.engine as any).shareDrafts.has(record.id),true);
+ await x.engine.action({action:'bili.delete',ids:[record.id]});
+ assert.equal(x.engine.data.record(record.id),null);assert.equal((x.engine as any).shareDrafts.has(record.id),false);
  }finally{await x.close();}});
 
 test('delete or stop during in-flight model work cannot resurrect a deleted record or save new completion',async()=>{
@@ -178,7 +345,7 @@ test('on restart an already enabled and confirmed account is rechecked without a
   const pending=x.engine.data.recommend(video.bvid,video.bvid);const t=Date.now();
   x.engine.data.putAttempt({id:'unfinished',origin:'recommended',status:'running',stage:'正在了解',reason:'',createdAt:t,updatedAt:t});
   x.engine.data.saveRecord(prior('old-pending'),x.engine.data.version());
-  await x.engine.dispose();x.providerCalls.length=0;
+  await x.disposeEngine();x.providerCalls.length=0;
   resumed=new BiliService(x.root,x.store,new Model(x.ctx,x.store),x.ctx,{canBrowse:()=>false,canDeliver:()=>true,system:()=>''},x.provider);
   assert.equal(resumed.data.recommendations().find(r=>r.id===pending.id)?.status,'failed');
   assert.equal(resumed.data.attempts().find(a=>a.id==='unfinished')?.status,'interrupted');

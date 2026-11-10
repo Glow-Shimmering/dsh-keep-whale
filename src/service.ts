@@ -7,6 +7,7 @@ import { Media } from './media.js';
 import { Embeddings } from './embedding.js';
 import { Appearance } from './appearance.js';
 import { BiliService } from './bili/service.js';
+import { contactWindow } from './core/contact.js';
 import type { Evidence, HostContext, Job, Memory, Message, Presence, RecallResult, Snapshot, Source } from './types.js';
 
 export function quietIntent(text:string):boolean|null {
@@ -49,7 +50,7 @@ export class Service {
     // Do not answer a pending/failed chat turn through background contact.
     // Whether an unanswered follow-up has new grounds is checked per source.
     const conversationReady=!last||(last.role==='assistant'&&last.status==='complete');
-    return conversationReady&&!this.disposed&&!this.runningChat&&!this.store.settings().quiet&&this.store.settings().proactiveEnabled&&p.length>0&&p.every(x=>now-x.at<20000&&!x.typing&&now-x.lastInputAt>=3000);
+    return conversationReady&&!this.disposed&&!this.runningChat&&!this.store.settings().quiet&&this.store.settings().proactiveEnabled&&contactWindow(this.store.contactTimestamps(),'general',now).allowed&&p.length>0&&p.every(x=>now-x.at<20000&&!x.typing&&now-x.lastInputAt>=3000);
   }
   private canBrowse():boolean {
     return !this.disposed&&!this.runningChat&&!this.background&&!this.taskRunning.size;
@@ -97,12 +98,12 @@ export class Service {
       case 'memory.detail':return this.store.memoryDetail(validId(body.id));
       case 'memory.profile':return this.store.personalityProfile();
       case 'memory.preview':return this.store.deletePreview(body.all===true?this.store.memories().map(m=>m.id):body.ids);
-      case 'memory.delete': { const ids=body.all===true?this.store.memories().map(m=>m.id):body.ids;if(!Array.isArray(ids)||(body.all===true||ids.length>1)&&body.confirm!==true)throw new ModelFailure('CONFIRM','请确认批量删除');this.runningChat?.abort();this.stopRelatedWork();this.store.deleteMemories(ids,body.revision);return {ok:true}; }
-      case 'memory.edit':this.runningChat?.abort();this.stopRelatedWork();return this.store.editMemory(validId(body.id),body.text);
+      case 'memory.delete': { const ids=body.all===true?this.store.memories().map(m=>m.id):body.ids;if(!Array.isArray(ids)||(body.all===true||ids.length>1)&&body.confirm!==true)throw new ModelFailure('CONFIRM','请确认批量删除');this.runningChat?.abort();this.stopRelatedWork();this.store.deleteMemories(ids,body.revision);this.bili.suppressShares();return {ok:true}; }
+      case 'memory.edit': {this.runningChat?.abort();this.stopRelatedWork();const edited=this.store.editMemory(validId(body.id),body.text);this.bili.suppressShares();return edited;}
       case 'memory.correct': {
         const memory=this.store.memoryDetail(validId(body.id))?.memory;
         if(!memory||!['understanding','tendency'].includes(memory.kind)||typeof body.text!=='string'||!body.text.trim()||body.text.length>4000)throw new ModelFailure('MEMORY','请提供对暂定理解或倾向的具体纠正');
-        this.runningChat?.abort();this.stopRelatedWork();
+        this.runningChat?.abort();this.stopRelatedWork();this.bili.suppressShares();
         const id='feedback:'+randomUUID(),text=body.text.trim(),now=Date.now();
         this.store.addSource({id,kind:'user_fact',provenance:'user_statement',text,context:'用户在管理界面对以下理解提出纠正：'+memory.text,occasion:id,createdAt:now,processed:false,revoked:false});
         const correction=this.store.saveMemory({kind:'understanding',text:'用户对先前理解提出纠正：'+text,sourceIds:[id],evidence:[{sourceId:id,quote:text}],status:'uncertain'});
@@ -112,7 +113,7 @@ export class Service {
       case 'memory.export':return {schemaVersion:2,companion:this.store.companion(),memories:this.store.memories(),sources:activeSources(this.store),details:this.store.memories().map(m=>this.store.memoryDetail(m.id))};
       case 'embedding.configure':this.stopRelatedWork();return this.embeddings.configure(body.config,body.apiKey,body.clearKey===true);
       case 'embedding.check': { const controller=new AbortController();this.management.add(controller);try{return await this.embeddings.check(controller.signal);}finally{this.management.delete(controller);} }
-      case 'messages.delete': {if(!Array.isArray(body.ids)||body.confirm!==true)throw new ModelFailure('CONFIRM','请确认删除选中消息及其对应回复');this.runningChat?.abort();this.background?.abort();this.store.deleteMessages(body.ids);return {ok:true};}
+      case 'messages.delete': {if(!Array.isArray(body.ids)||body.confirm!==true)throw new ModelFailure('CONFIRM','请确认删除选中消息及其对应回复');this.runningChat?.abort();this.background?.abort();this.store.deleteMessages(body.ids);this.bili.suppressShares();return {ok:true};}
       case 'skin.reset':return this.store.patchSettings({skin:null});
       case 'models.refresh':await this.refreshModels();return this.models;
       case 'billing.acknowledge': {

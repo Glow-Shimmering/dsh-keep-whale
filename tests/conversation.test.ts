@@ -74,7 +74,38 @@ test('voluntary follow-up gives the user the floor across sources and a service 
   f.message('user-back','user','这个角度确实有意思',Date.now()+1);
   assert.equal(f.service.canDeliver(),false,'a new user turn should get its normal reply first');
   f.message('reply','assistant','对，解释缘由与承担责任可以同时成立。',Date.now()+2,{requestId:'user-back'});
+  assert.equal(f.service.canDeliver(),false,'the user reply does not cancel the minimum contact interval');
+});
+
+test('general proactive contact only uses the ten-minute gap even if a prior contact was unanswered',t=>{
+  const f=fixture(t),now=Date.now();
+  f.message('unanswered','assistant','一个还没有得到回复的主动消息',now-5*60_000,{origin:'proactive'});
+  assert.equal(f.service.canDeliver(),false);
+  const later=fixture(t);
+  later.message('unanswered-old','assistant','更早的主动消息',now-11*60_000,{origin:'proactive'});
+  assert.equal(later.service.canDeliver(),true);
+});
+
+test('a new user reply permits contact only after the shared minimum interval',t=>{
+  const f=fixture(t),now=Date.now();
+  f.message('old-contact','assistant','一条主动消息',now-2*60_000,{origin:'proactive'});
+  f.message('user-reply','user','我看到了',now-90_000);
+  f.message('reply','assistant','嗯。',now-80_000,{requestId:'user-reply'});
+  assert.equal(f.service.canDeliver(),false);
+});
+
+test('general contact can resume after the minimum interval when the user has replied',t=>{
+  const f=fixture(t),now=Date.now();
+  f.message('old-contact','assistant','一条主动消息',now-11*60_000,{origin:'proactive'});
+  f.message('user-reply','user','我看到了',now-10*60_000);
+  f.message('reply','assistant','嗯。',now-9*60_000,{requestId:'user-reply'});
   assert.equal(f.service.canDeliver(),true);
+});
+
+test('a Bilibili share also delays generic proactive contact',t=>{
+  const f=fixture(t),now=Date.now();
+  f.message('bili-share','assistant','一条视频分享',now-2*60_000,{origin:'proactive',requestId:'bili-share:example'});
+  assert.equal(f.service.canDeliver(),false);
 });
 
 test('continuation includes complete dated turns, excludes partial output and respects withdrawn evidence',async t=>{
@@ -93,6 +124,20 @@ test('continuation includes complete dated turns, excludes partial output and re
   assert.deepEqual(request.recent.map((m:any)=>m.id),['secret','current','finished']);
   assert.ok(request.recent.every((m:any)=>Number.isFinite(Date.parse(m.at))&&m.origin==='chat'));
   assert.doesNotMatch(JSON.stringify(request),/海蓝石|半句话/);
+});
+
+test('deleting a memory immediately removes any pending private video share draft',async t=>{
+ const f=fixture(t),now=Date.now();
+ f.message('secret-user','user','我暂时不想继续记住这件事',now-80000);
+ f.store.addSource({id:'chat:secret-user',kind:'user_fact',text:'我暂时不想继续记住这件事',occasion:'secret-user',createdAt:now-80000,processed:false,revoked:false});
+ const memory=f.store.saveMemory({kind:'user_fact',text:'我暂时不想继续记住这件事',sourceIds:['chat:secret-user']})!;
+ f.message('last-answer','assistant','我明白了。',now-70000,{requestId:'secret-user'});
+ const bili=f.service.bili;
+ const record=bili.data.saveRecord({id:'pending-video',video:{bvid:'BV1xx411c7mD',aid:123,cid:456,title:'测试视频',owner:'UP 主',ownerId:'1234',duration:100,url:'https://www.bilibili.com/video/BV1xx411c7mD'},origin:'autonomous',createdAt:now,summary:'内容',opinion:'看法',topics:[],coverage:'字幕和画面',limitations:[],excerpts:[{from:0,to:3,text:'字幕'}],frameTimes:[1],liked:false,favorited:false,actionReason:'',shareText:'',shareStatus:'pending'},bili.data.version())!;
+ (bili as any).shareDrafts.set(record.id,{text:'可能引用已撤回事实的草稿',kind:'connection',reason:'仅存内存',contextId:'last-answer',revision:f.store.revision()});
+ await f.service.action({action:'memory.delete',ids:[memory.id]});
+ assert.equal((bili as any).shareDrafts.size,0);assert.notEqual(bili.data.record(record.id)?.shareStatus,'pending');
+ assert.equal(f.store.messages().filter(m=>m.origin==='proactive').length,0);
 });
 
 test('older private turns cannot become a follow-up after the conversation has moved on',async t=>{
@@ -147,8 +192,8 @@ test('failed or cancelled direct replies are not resumed by unsolicited contact'
 test('a genuinely new allowed observation can warrant contact, but old observations cannot pile up',async t=>{
   const f=fixture(t),now=Date.now();
   f.setClockOffset(-180000);f.store.patchSettings({observeEnabled:true});f.setClockOffset(0);
-  f.message('previous-contact','assistant','刚才那个区别让我想到人物动机。',now-120000,{origin:'proactive'});
-  for(const [id,at] of [['old-observation',now-150000],['new-observation',now-65000]] as const){
+  f.message('previous-contact','assistant','刚才那个区别让我想到人物动机。',now-4*60*60_000,{origin:'proactive'});
+  for(const [id,at] of [['old-observation',now-5*60*60_000],['new-observation',now-65000]] as const){
     f.store.addSource({id,kind:'observed_dialogue',provenance:'observation',text:'用户在普通对话中分享了一个新的阅读发现',occasion:id,createdAt:at,sessionId:'ordinary',workspace:'/allowed',processed:false,revoked:false});
     f.store.markProcessed([id]);
   }
