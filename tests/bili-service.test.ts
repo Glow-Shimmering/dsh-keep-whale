@@ -16,10 +16,12 @@ const prior=(id:string):Omit<BiliRecord,'version'>=>({id,video:{...video,bvid:'B
 const waitFor=async(fn:()=>boolean)=>{for(let i=0;i<100;i++){if(fn())return;await new Promise(r=>setTimeout(r,10));}assert.fail('task did not settle');};
 function setup(){
  const root=mkdtempSync(join(tmpdir(),'whale-bili-service-')),store=new Store(root),calls:any[]=[],providerCalls:string[]=[];
- let canBrowse=true,canDeliver=true,networkFailure=false,noUsage=false,truncateCalls=0,hold:Promise<void>|null=null,content=material(), accountLoggedIn=true,engage=false;
+ let canBrowse=true,canDeliver=true,networkFailure=false,noUsage=false,truncateCalls=0,hold:Promise<void>|null=null,content=material(), accountLoggedIn=true,engage=false,segmentResponses:unknown[]=[],reflectionResponses:unknown[]=[],lowerBudgetAfterSegment=false;
  const llm={resolveModelInfo:async()=>({inputModalities:['text','image'],context:{contextWindow:1000000}}),imageRequestPricing:()=>({priceImages:(images:any[])=>images.map(()=>({visualTokens:256,text:''}))}),
   async *stream(options:any){calls.push(options);if(hold)await hold;
-   const response=options.system.includes('挑选自己')?{bvid:video.bvid,reason:'对内容好奇'}:options.system.includes('一个片段')?{notes:'字幕描述操作，画面展示场景',limitations:['画面为抽样']}:{summary:'视频介绍了游戏操作。',opinion:'步骤具体，但效果仍需实测。',topics:['游戏'],limitations:['抽样不等于完整视觉'],share:true,shareText:'我看到一个操作讲解，步骤还挺具体。',like:engage,favorite:engage,actionReason:engage?'内容值得对照练习':''};
+   const segment=options.system.includes('一个片段');
+   const response=options.system.includes('挑选自己')?{bvid:video.bvid,reason:'对内容好奇'}:segment?(segmentResponses.length?segmentResponses.shift():{notes:'字幕描述操作，画面展示场景',limitations:['画面为抽样']}):(reflectionResponses.length?reflectionResponses.shift():{summary:'视频介绍了游戏操作。',opinion:'步骤具体，但效果仍需实测。',topics:['游戏'],limitations:['抽样不等于完整视觉'],share:true,shareText:'我看到一个操作讲解，步骤还挺具体。',like:engage,favorite:engage,actionReason:engage?'内容值得对照练习':''});
+   if(segment&&lowerBudgetAfterSegment){lowerBudgetAfterSegment=false;store.patchSettings({dailyLimit:.05});}
    yield {type:'text-delta',text:JSON.stringify(response)};
    if(!noUsage)yield {type:'usage',usage:{inputTokens:200,outputTokens:80,cacheReadTokens:100,cacheWriteTokens:0}};
    const truncated=truncateCalls>0;if(truncated)truncateCalls--;yield {type:'finish',reason:{kind:truncated?'max-tokens':'stop'}};
@@ -34,7 +36,7 @@ function setup(){
  store.patchSettings({model:route,priceRoute:route,prices:{input:30,cached:.6,output:120},dailyLimit:100});
  const engine=new BiliService(root,store,new Model(ctx,store),ctx,{canBrowse:()=>canBrowse,canDeliver:()=>canDeliver,system:()=> '独立伙伴设定'},provider);
  const ready=async()=>{await engine.action({action:'bili.account.check'});await waitFor(()=>!engine.busy());await engine.action({action:'bili.account.confirm',mid:'1234'});await engine.check();};
- return {root,store,engine,ctx,provider,calls,providerCalls,ready,setBrowse:(v:boolean)=>canBrowse=v,setDeliver:(v:boolean)=>canDeliver=v,setNetworkFailure:(v:boolean)=>networkFailure=v,setUsage:(v:boolean)=>noUsage=!v,setTruncate:(n:number)=>truncateCalls=n,setHold:(p:Promise<void>|null)=>hold=p,setMaterial:(v:BiliMaterial)=>content=v,setLoggedIn:(v:boolean)=>accountLoggedIn=v,setEngage:(v:boolean)=>engage=v,close:async()=>{await engine.dispose();store.close();rmSync(root,{recursive:true,force:true});}};
+ return {root,store,engine,ctx,provider,calls,providerCalls,ready,setBrowse:(v:boolean)=>canBrowse=v,setDeliver:(v:boolean)=>canDeliver=v,setNetworkFailure:(v:boolean)=>networkFailure=v,setUsage:(v:boolean)=>noUsage=!v,setTruncate:(n:number)=>truncateCalls=n,setHold:(p:Promise<void>|null)=>hold=p,setMaterial:(v:BiliMaterial)=>content=v,setLoggedIn:(v:boolean)=>accountLoggedIn=v,setEngage:(v:boolean)=>engage=v,setSegmentResponses:(v:unknown[])=>segmentResponses=[...v],setReflectionResponses:(v:unknown[])=>reflectionResponses=[...v],lowerBudgetAfterSegment:()=>lowerBudgetAfterSegment=true,close:async()=>{await engine.dispose();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 
 test('not enabled or unconfirmed never begins browsing',async()=>{const x=setup();try{
@@ -58,6 +60,50 @@ test('complete subtitle and picture understanding saves one experience and costs
  assert.equal(x.calls.length,3);assert.ok(x.store.ledger().filter(l=>l.budgetScope==='bilibili').length===3);
  const r=x.engine.data.records()[0];assert.equal(r.origin,'autonomous');assert.equal(r.video.bvid,video.bvid);assert.equal(r.coverage,'全片字幕，抽取两帧');assert.ok(r.excerpts.length&&r.frameTimes.length);
  assert.equal(x.store.memories().length,0);assert.equal(x.store.sources().length,0);assert.equal(x.store.messages().length,0);
+ }finally{await x.close();}});
+
+test('segment notes may be a list of text items and are passed through to the final reflection',async()=>{const x=setup();try{
+ await x.ready();x.setSegmentResponses([{notes:['字幕描述操作','画面展示场景'],limitations:['画面为抽样']}]);
+ await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ assert.equal(x.engine.data.attempts()[0].status,'succeeded');assert.equal(x.engine.data.records().length,1);
+ assert.equal(x.calls.length,2);const reflection=JSON.stringify(x.calls[1].messages);
+ assert.match(reflection,/字幕描述操作/);assert.match(reflection,/画面展示场景/);
+ const ledger=x.store.ledger().filter(l=>l.budgetScope==='bilibili');assert.equal(ledger.length,2);assert.ok(ledger.every(l=>l.status==='settled'&&l.actual!>0));
+ }finally{await x.close();}});
+
+test('valid JSON missing segment notes gets one field-specific repair without enlarging output budget',async()=>{const x=setup();try{
+ await x.ready();x.setSegmentResponses([{limitations:['画面为抽样']},{notes:'字幕描述操作，画面展示场景',limitations:['画面为抽样']}]);
+ await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ assert.equal(x.engine.data.attempts()[0].status,'succeeded');assert.equal(x.engine.data.records().length,1);
+ assert.equal(x.calls.length,3);assert.equal(x.calls[0].maxTokens,x.calls[1].maxTokens);assert.match(x.calls[1].system,/notes/);
+ const ledger=x.store.ledger().filter(l=>l.budgetScope==='bilibili');assert.equal(ledger.length,3);assert.ok(ledger.every(l=>l.status==='settled'&&l.actual!>0));
+ assert.equal(x.store.messages().length,0);
+ }finally{await x.close();}});
+
+test('repeated missing or non-text segment notes fail after one repair without saving or sharing',async()=>{
+ for(const invalid of [{}, {notes:''}, {notes:[]}, {notes:{text:'不应转换成事实'}}, {notes:['字幕描述',42]}]){const x=setup();try{
+  await x.ready();x.setSegmentResponses([invalid,invalid]);await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+  assert.equal(x.engine.data.attempts()[0].status,'failed');assert.equal(x.engine.data.records().length,0);
+  assert.equal(x.calls.length,2);assert.equal(x.calls[0].maxTokens,x.calls[1].maxTokens);assert.match(x.calls[1].system,/notes/);
+  const ledger=x.store.ledger().filter(l=>l.budgetScope==='bilibili');assert.equal(ledger.length,2);assert.ok(ledger.every(l=>l.status==='settled'&&l.actual!>0));
+  x.engine.deliver();assert.equal(x.store.messages().length,0);assert.equal(x.providerCalls.includes('like'),false);assert.equal(x.providerCalls.includes('favorite'),false);
+ }finally{await x.close();}}
+});
+
+test('missing final opinion gets one field-specific repair before saving the experience',async()=>{const x=setup();try{
+ await x.ready();x.setReflectionResponses([{summary:'视频介绍了游戏操作。'},{summary:'视频介绍了游戏操作。',opinion:'步骤具体，但效果仍需实测。'}]);
+ await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ assert.equal(x.engine.data.attempts()[0].status,'succeeded');assert.equal(x.engine.data.records().length,1);
+ assert.equal(x.calls.length,3);assert.equal(x.calls[1].maxTokens,x.calls[2].maxTokens);assert.match(x.calls[2].system,/opinion/);
+ const ledger=x.store.ledger().filter(l=>l.budgetScope==='bilibili');assert.equal(ledger.length,3);assert.ok(ledger.every(l=>l.status==='settled'&&l.actual!>0));
+ }finally{await x.close();}});
+
+test('segment format repair does not call the model when the remaining budget is insufficient',async()=>{const x=setup();try{
+ await x.ready();x.setSegmentResponses([{}]);x.lowerBudgetAfterSegment();
+ await x.engine.action({action:'bili.recommend',input:video.bvid});await x.engine.tick();
+ assert.equal(x.engine.data.attempts()[0].status,'failed');assert.equal(x.engine.data.records().length,0);
+ assert.equal(x.calls.length,1);const ledger=x.store.ledger().filter(l=>l.budgetScope==='bilibili');assert.equal(ledger.length,1);assert.ok(ledger[0].actual!>0);
+ assert.ok(x.store.usage(true).spent<=.05);assert.equal(x.store.messages().length,0);
  }finally{await x.close();}});
 
 test('failed content reads remain a failed attempt and never become watched records',async()=>{const x=setup();try{
